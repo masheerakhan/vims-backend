@@ -497,7 +497,7 @@ def send_finance_email(
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 36px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              {_BRAND_FULL} &middot; Vendor Invoice Management &middot; Do not reply to this email
+              {_BRAND_FULL} &middot; AgileTrack &middot; Do not reply to this email
             </p>
           </td>
         </tr>

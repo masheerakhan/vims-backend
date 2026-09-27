@@ -6,7 +6,7 @@ from django.conf.urls.static import static
 # Customize Django Admin branding
 admin.site.site_header = "VIMS Administration"
 admin.site.site_title = "VIMS Admin"
-admin.site.index_title = "Horizon Industrial Parks - Vendor Invoice Management"
+admin.site.index_title = "Horizon Industrial Parks - AgileTrack"
 
 urlpatterns = [
     path("django-admin/", admin.site.urls),

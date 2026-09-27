@@ -18,6 +18,8 @@ from apps.vendors.models import (
     VendorInvitation,
     VendorOnboardingSubmission,
     VendorTrainingVideo,
+    VendorImportBatch,
+    VendorImportRow,
 )
 from apps.vendors.services import (
     FinanceTokenError,
@@ -47,8 +49,12 @@ from apps.vendors.route_services import (
     get_route_assignee_replacement_options,
     replace_route_assignee,
 )
-from apps.access.selectors import get_user_actionable_scope_ids, get_user_visible_scope_ids
-from apps.access.services import user_can_act_on_scope_response
+from apps.access.selectors import (
+    get_user_actionable_scope_ids,
+    get_user_visible_scope_ids,
+    get_user_visible_org_ids,
+)
+from apps.access.services import user_can_act_on_scope_or_ancestors_response as user_can_act_on_scope_response
 from apps.vendors.api.serializers import (
     FinanceApproveSerializer,
     FinanceRejectSerializer,
@@ -76,6 +82,10 @@ from apps.vendors.api.serializers import (
     VendorSubmissionRouteReplaceAssigneeSerializer,
     VendorSubmissionRouteUpdateSerializer,
     VendorSubmissionRouteVendorSerializer,
+    VendorImportUploadSerializer,
+    VendorImportRowSerializer,
+    VendorImportBatchSerializer,
+    VendorImportBatchListSerializer,
     VendorTrainingVideoSerializer,
 )
 
@@ -358,11 +368,19 @@ class VendorViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "patch", "post", "head", "options"]
 
     def get_queryset(self):
+        from django.db.models import Q
         visible_scope_ids = get_user_visible_scope_ids(self.request.user)
         qs = Vendor.objects.select_related(
             "org", "scope_node", "onboarding_submission", "approved_by_marketing"
-        ).filter(scope_node_id__in=visible_scope_ids)
+        ).filter(scope_node_id__in=visible_scope_ids).order_by("-id")
         params = self.request.query_params
+        if search := params.get("search"):
+            q_clean = search.strip()
+            qs = qs.filter(
+                Q(vendor_name__icontains=q_clean) |
+                Q(sap_vendor_id__icontains=q_clean) |
+                Q(email__icontains=q_clean)
+            )
         if org_id := params.get("org"):
             qs = qs.filter(org_id=org_id)
         if scope_node_id := params.get("scope_node"):
@@ -1426,3 +1444,144 @@ class VendorProfileRevisionViewSet(viewsets.ViewSet):
         except SubmissionStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(VendorProfileRevisionSerializer(updated).data)
+
+
+# ---------------------------------------------------------------------------
+# Vendor Import Batches (Bulk Import for Tenant Admin)
+# ---------------------------------------------------------------------------
+
+class VendorImportBatchViewSet(viewsets.ModelViewSet):
+    """
+    Bulk Vendor Import endpoints restricted strictly to Tenant Admin.
+
+    GET  /api/v1/vendors/import-batches/template/ — Download blank Excel template
+    POST /api/v1/vendors/import-batches/upload/   — Upload & parse .xlsx/.csv file
+    POST /api/v1/vendors/import-batches/{id}/validate/ — Validate all rows
+    POST /api/v1/vendors/import-batches/{id}/commit/   — Commit valid rows to live directory
+    GET  /api/v1/vendors/import-batches/          — List past import batches
+    GET  /api/v1/vendors/import-batches/{id}/     — Batch detail with rows
+    """
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_permissions(self):
+        if self.action == "template":
+            return [AllowAny()]
+        return super().get_permissions()
+
+    def _is_tenant_admin(self, user) -> bool:
+        if user.is_superuser:
+            return True
+        from apps.access.models import UserRoleAssignment
+        return UserRoleAssignment.objects.filter(
+            user=user,
+            role__code="tenant_admin",
+            role__is_active=True,
+        ).exists()
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        if self.action == "template":
+            return
+        if not self._is_tenant_admin(request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Only Tenant Admin users can manage bulk vendor imports.")
+
+    def get_queryset(self):
+        visible_org_ids = get_user_visible_org_ids(self.request.user)
+        return VendorImportBatch.objects.filter(org_id__in=visible_org_ids).order_by("-created_at")
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return VendorImportBatchListSerializer
+        return VendorImportBatchSerializer
+
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {"detail": "Use /import-batches/upload/ to upload a file."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    @action(detail=False, methods=["get"], url_path="template")
+    def template(self, request):
+        """Download styled blank Excel template."""
+        from apps.vendors.import_services import generate_vendor_import_template
+        from django.http import HttpResponse
+        buffer = generate_vendor_import_template()
+        response = HttpResponse(
+            buffer.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = 'attachment; filename="Vendor_Import_Template.xlsx"'
+        return response
+
+    @action(detail=False, methods=["post"], url_path="upload")
+    def upload(self, request):
+        """Upload .xlsx/.csv file, parse rows, and create import batch."""
+        from apps.vendors.import_services import (
+            parse_vendor_import_file,
+            create_vendor_import_batch,
+            validate_vendor_import_batch,
+        )
+        from apps.core.models import Organization
+
+        serializer = VendorImportUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        uploaded_file = serializer.validated_data["file"]
+        requested_org_id = serializer.validated_data.get("org")
+
+        if requested_org_id:
+            try:
+                org = Organization.objects.get(pk=requested_org_id)
+            except Organization.DoesNotExist:
+                return Response({"detail": "Organization not found."}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            visible_org_ids = get_user_visible_org_ids(request.user)
+            org = Organization.objects.filter(id__in=visible_org_ids).first()
+            if not org:
+                org = Organization.objects.first()
+
+        if not org:
+            return Response({"detail": "No organization context found."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            parsed_rows = parse_vendor_import_file(uploaded_file)
+        except Exception as exc:
+            return Response({"detail": f"Failed to parse file: {str(exc)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not parsed_rows:
+            return Response({"detail": "The uploaded file has no data rows."}, status=status.HTTP_400_BAD_REQUEST)
+
+        batch = create_vendor_import_batch(
+            org=org,
+            file_name=uploaded_file.name,
+            parsed_rows=parsed_rows,
+            user=request.user,
+        )
+
+        # Automatically trigger initial validation
+        batch = validate_vendor_import_batch(batch)
+
+        return Response(VendorImportBatchSerializer(batch).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="validate")
+    def validate(self, request, pk=None):
+        """Re-validate batch rows."""
+        from apps.vendors.import_services import validate_vendor_import_batch
+        batch = self.get_object()
+        batch = validate_vendor_import_batch(batch)
+        return Response(VendorImportBatchSerializer(batch).data)
+
+    @action(detail=True, methods=["post"], url_path="commit")
+    def commit(self, request, pk=None):
+        """Commit all valid rows in the batch to the Vendor Directory."""
+        from apps.vendors.import_services import commit_vendor_import_batch
+        batch = self.get_object()
+        if batch.valid_rows == 0:
+            return Response(
+                {"detail": "This batch has 0 valid rows to commit."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        batch = commit_vendor_import_batch(batch, user=request.user)
+        return Response(VendorImportBatchSerializer(batch).data)

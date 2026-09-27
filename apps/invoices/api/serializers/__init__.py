@@ -7,6 +7,7 @@ from apps.invoices.models import (
     Invoice, InvoiceDocument, InvoiceDocumentType,
     InvoiceStatus, VendorInvoiceSubmission,
     VendorInvoiceSubmissionStatus,
+    InvoiceImportBatch, InvoiceImportRow,
 )
 from apps.core.models import ScopeNode
 from apps.vendors.models import Vendor
@@ -471,3 +472,113 @@ class InvoicePaymentUpdateSerializer(serializers.Serializer):
             if errors:
                 raise serializers.ValidationError(errors)
         return attrs
+
+
+# ---------------------------------------------------------------------------
+# Invoice Import Batches
+# ---------------------------------------------------------------------------
+
+class InvoiceImportUploadSerializer(serializers.Serializer):
+    file = serializers.FileField(required=True)
+    org = serializers.IntegerField(required=False)
+
+    def validate_file(self, value):
+        name = value.name.lower()
+        if not (name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".csv")):
+            raise serializers.ValidationError("Only .xlsx, .xls, or .csv files are supported.")
+        if value.size > 25 * 1024 * 1024:
+            raise serializers.ValidationError("File size exceeds the 25 MB limit.")
+        return value
+
+
+class InvoiceImportRowSerializer(serializers.ModelSerializer):
+    resolved_vendor_name = serializers.CharField(source="resolved_vendor.vendor_name", read_only=True, default=None)
+    resolved_scope_name = serializers.CharField(source="resolved_scope_node.name", read_only=True, default=None)
+    resolved_category_name = serializers.CharField(source="resolved_category.name", read_only=True, default=None)
+    resolved_subcategory_name = serializers.CharField(source="resolved_subcategory.name", read_only=True, default=None)
+    resolved_budget_name = serializers.CharField(source="resolved_budget.name", read_only=True, default=None)
+
+    class Meta:
+        model = InvoiceImportRow
+        fields = [
+            "id",
+            "batch",
+            "row_number",
+            "invoice_number",
+            "vendor_name",
+            "work_description",
+            "amount",
+            "main_head",
+            "budget_head",
+            "sub_category",
+            "resolved_vendor",
+            "resolved_vendor_name",
+            "vendor_is_new",
+            "resolved_scope_node",
+            "resolved_scope_name",
+            "resolved_budget",
+            "resolved_budget_name",
+            "resolved_category",
+            "resolved_category_name",
+            "resolved_subcategory",
+            "resolved_subcategory_name",
+            "resolved_budget_line",
+            "created_invoice",
+            "status",
+            "error_messages",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class InvoiceImportBatchSerializer(serializers.ModelSerializer):
+    rows = InvoiceImportRowSerializer(many=True, read_only=True)
+    uploaded_by_email = serializers.CharField(source="uploaded_by.email", read_only=True, default=None)
+
+    class Meta:
+        model = InvoiceImportBatch
+        fields = [
+            "id",
+            "org",
+            "file_name",
+            "uploaded_by",
+            "uploaded_by_email",
+            "status",
+            "total_rows",
+            "valid_rows",
+            "error_rows",
+            "created_invoices_count",
+            "created_vendors_count",
+            "total_amount_deducted",
+            "error_summary",
+            "activity_logs",
+            "created_at",
+            "updated_at",
+            "rows",
+        ]
+        read_only_fields = fields
+
+
+class InvoiceImportBatchListSerializer(serializers.ModelSerializer):
+    uploaded_by_email = serializers.CharField(source="uploaded_by.email", read_only=True, default=None)
+
+    class Meta:
+        model = InvoiceImportBatch
+        fields = [
+            "id",
+            "org",
+            "file_name",
+            "uploaded_by",
+            "uploaded_by_email",
+            "status",
+            "total_rows",
+            "valid_rows",
+            "error_rows",
+            "created_invoices_count",
+            "created_vendors_count",
+            "total_amount_deducted",
+            "activity_logs",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields

@@ -20,6 +20,7 @@ from apps.vendors.api.views import (
     PublicVendorActivateValidateView,
     VendorAttachmentViewSet,
     VendorInvitationViewSet,
+    VendorImportBatchViewSet,
     VendorPortalProfileRevisionView,
     VendorPortalProfileView,
     VendorPortalRevisionHistoryView,
@@ -35,6 +36,7 @@ from apps.vendors.api.views import (
 
 router = DefaultRouter()
 router.register("invitations", VendorInvitationViewSet, basename="vendorinvitation")
+router.register("import-batches", VendorImportBatchViewSet, basename="vendorimportbatch")
 router.register("submissions", VendorSubmissionViewSet, basename="vendorsubmission")
 router.register("attachments", VendorAttachmentViewSet, basename="vendorattachment")
 router.register("send-to-options", VendorSubmissionRouteViewSet, basename="vendorsubmissionroute")

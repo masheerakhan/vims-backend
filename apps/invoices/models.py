@@ -606,3 +606,154 @@ class InvoicePayment(models.Model):
 
     def __str__(self):
         return f"InvoicePayment [{self.payment_status}] {self.invoice_id}"
+
+
+# ---------------------------------------------------------------------------
+# Invoice Import Batches (Bulk Invoice Upload & Budget Deduction)
+# ---------------------------------------------------------------------------
+
+class InvoiceImportBatchStatus(models.TextChoices):
+    UPLOADED = "uploaded", "Uploaded"
+    VALIDATING = "validating", "Validating"
+    VALIDATED = "validated", "Validated"
+    COMMITTING = "committing", "Committing"
+    COMMITTED = "committed", "Committed"
+    FAILED = "failed", "Failed"
+
+
+class InvoiceImportRowStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    VALID = "valid", "Valid"
+    SKIPPED = "skipped", "Skipped (Already Imported)"
+    ERROR = "error", "Error"
+    COMMITTED = "committed", "Committed"
+
+
+class InvoiceImportBatch(models.Model):
+    org = models.ForeignKey(
+        "core.Organization",
+        on_delete=models.CASCADE,
+        related_name="invoice_import_batches",
+    )
+    file_name = models.CharField(max_length=500)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="invoice_import_batches",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=InvoiceImportBatchStatus.choices,
+        default=InvoiceImportBatchStatus.UPLOADED,
+    )
+    total_rows = models.PositiveIntegerField(default=0)
+    valid_rows = models.PositiveIntegerField(default=0)
+    error_rows = models.PositiveIntegerField(default=0)
+    created_invoices_count = models.PositiveIntegerField(default=0)
+    created_vendors_count = models.PositiveIntegerField(default=0)
+    total_amount_deducted = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    error_summary = models.JSONField(default=list, blank=True)
+    activity_logs = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "invoice_import_batches"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["org", "status"]),
+        ]
+
+    def __str__(self):
+        return f"InvoiceImportBatch {self.id}: {self.file_name} [{self.status}]"
+
+
+class InvoiceImportRow(models.Model):
+    batch = models.ForeignKey(
+        InvoiceImportBatch,
+        on_delete=models.CASCADE,
+        related_name="rows",
+    )
+    row_number = models.PositiveIntegerField()
+    raw_data = models.JSONField(default=dict, blank=True)
+
+    # Raw extracted fields
+    invoice_number = models.CharField(max_length=255, blank=True)
+    vendor_name = models.CharField(max_length=255, blank=True)
+    work_description = models.TextField(blank=True)
+    amount = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    main_head = models.CharField(max_length=100, blank=True)
+    budget_head = models.CharField(max_length=255, blank=True)
+    sub_category = models.CharField(max_length=255, blank=True)
+
+    # Resolved references
+    resolved_vendor = models.ForeignKey(
+        "vendors.Vendor",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_rows",
+    )
+    vendor_is_new = models.BooleanField(default=False)
+    resolved_scope_node = models.ForeignKey(
+        "core.ScopeNode",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="invoice_import_rows",
+    )
+    resolved_budget = models.ForeignKey(
+        "budgets.Budget",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="invoice_import_rows",
+    )
+    resolved_category = models.ForeignKey(
+        "budgets.BudgetCategory",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="invoice_import_rows",
+    )
+    resolved_subcategory = models.ForeignKey(
+        "budgets.BudgetSubCategory",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="invoice_import_rows",
+    )
+    resolved_budget_line = models.ForeignKey(
+        "budgets.BudgetLine",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="invoice_import_rows",
+    )
+    created_invoice = models.ForeignKey(
+        "invoices.Invoice",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_source_rows",
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=InvoiceImportRowStatus.choices,
+        default=InvoiceImportRowStatus.PENDING,
+    )
+    error_messages = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "invoice_import_rows"
+        ordering = ["row_number"]
+        indexes = [
+            models.Index(fields=["batch", "status"]),
+        ]
+
+    def __str__(self):
+        return f"InvoiceImportRow {self.batch_id}:{self.row_number} - {self.invoice_number} [{self.status}]"

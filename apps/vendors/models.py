@@ -786,3 +786,119 @@ class VendorSubmissionRoute(models.Model):
 
     def __str__(self):
         return f"Route {self.code} → '{self.label}' (template={self.workflow_template_id})"
+
+
+# ---------------------------------------------------------------------------
+# Vendor Import Batches (Bulk Import for Tenant Admin)
+# ---------------------------------------------------------------------------
+
+class VendorImportBatchStatus(models.TextChoices):
+    UPLOADED = "uploaded", "Uploaded"
+    VALIDATING = "validating", "Validating"
+    VALIDATED = "validated", "Validated"
+    COMMITTING = "committing", "Committing"
+    COMMITTED = "committed", "Committed"
+    FAILED = "failed", "Failed"
+
+
+class VendorImportRowStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    VALID = "valid", "Valid"
+    ERROR = "error", "Error"
+    COMMITTED = "committed", "Committed"
+
+
+class VendorImportBatch(models.Model):
+    org = models.ForeignKey(
+        "core.Organization",
+        on_delete=models.CASCADE,
+        related_name="vendor_import_batches",
+    )
+    file_name = models.CharField(max_length=500)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="vendor_import_batches",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=VendorImportBatchStatus.choices,
+        default=VendorImportBatchStatus.UPLOADED,
+    )
+    total_rows = models.PositiveIntegerField(default=0)
+    valid_rows = models.PositiveIntegerField(default=0)
+    error_rows = models.PositiveIntegerField(default=0)
+    created_vendors_count = models.PositiveIntegerField(default=0)
+    updated_vendors_count = models.PositiveIntegerField(default=0)
+    error_summary = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "vendor_import_batches"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["org", "status"]),
+        ]
+
+    def __str__(self):
+        return f"VendorImportBatch {self.id}: {self.file_name} [{self.status}]"
+
+
+class VendorImportRow(models.Model):
+    batch = models.ForeignKey(
+        VendorImportBatch,
+        on_delete=models.CASCADE,
+        related_name="rows",
+    )
+    row_number = models.PositiveIntegerField()
+    raw_data = models.JSONField(default=dict, blank=True)
+
+    # Core fields
+    sap_vendor_id = models.CharField(max_length=100, blank=True)
+    vendor_name = models.CharField(max_length=255, blank=True)
+    scope_node_code = models.CharField(max_length=100, blank=True)
+    email = models.CharField(max_length=255, blank=True)
+    phone = models.CharField(max_length=50, blank=True)
+
+    # Tax / compliance
+    pan = models.CharField(max_length=20, blank=True)
+    gstin = models.CharField(max_length=20, blank=True)
+    gst_registered = models.BooleanField(null=True, blank=True)
+
+    # Address
+    address_line1 = models.CharField(max_length=255, blank=True)
+    city = models.CharField(max_length=100, blank=True)
+    state = models.CharField(max_length=100, blank=True)
+    country = models.CharField(max_length=100, blank=True, default="India")
+    pincode = models.CharField(max_length=20, blank=True)
+
+    # Bank
+    bank_name = models.CharField(max_length=255, blank=True)
+    account_number = models.CharField(max_length=50, blank=True)
+    ifsc = models.CharField(max_length=20, blank=True)
+    beneficiary_name = models.CharField(max_length=255, blank=True)
+    preferred_payment_mode = models.CharField(max_length=100, blank=True)
+
+    # Flags
+    po_mandate_enabled = models.BooleanField(default=False)
+
+    status = models.CharField(
+        max_length=20,
+        choices=VendorImportRowStatus.choices,
+        default=VendorImportRowStatus.PENDING,
+    )
+    error_messages = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "vendor_import_rows"
+        ordering = ["row_number"]
+        indexes = [
+            models.Index(fields=["batch", "status"]),
+        ]
+
+    def __str__(self):
+        return f"VendorImportRow {self.batch_id}:{self.row_number} - {self.vendor_name} [{self.status}]"

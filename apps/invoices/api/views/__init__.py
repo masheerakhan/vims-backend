@@ -15,12 +15,16 @@ from apps.invoices.models import (
     InvoiceStatus,
     InvoicePayment,
     PaymentMethod,
+    InvoiceImportBatch,
+    InvoiceImportRow,
 )
 from apps.invoices.api.serializers import (
     InvoiceSerializer, InvoiceCreateSerializer,
     InvoicePaymentSerializer, VendorInvoicePaymentSerializer, InvoicePaymentUpdateSerializer,
     HistoricalInvoicePostSerializer, HistoricalInvoiceReverseSerializer,
     InvoiceDocumentSerializer,
+    InvoiceImportUploadSerializer, InvoiceImportRowSerializer,
+    InvoiceImportBatchSerializer, InvoiceImportBatchListSerializer,
 )
 from apps.invoices.services import (
     create_invoice, InvoicePermissionError, InvoicePOMandateError,
@@ -1256,3 +1260,154 @@ class InvoiceDocumentViewSet(ViewSet):
             "document_type": doc.document_type,
             "download_url": request.build_absolute_uri(doc.file.url),
         })
+
+
+# ---------------------------------------------------------------------------
+# Invoice Import Batches (Bulk Invoice Upload & Budget Deduction)
+# ---------------------------------------------------------------------------
+
+class InvoiceImportBatchViewSet(ModelViewSet):
+    """
+    Bulk Invoice Import endpoints restricted strictly to Tenant Admin / Org Admin / Superuser.
+
+    GET  /api/v1/invoices/import-batches/template/ — Download styled blank Excel template
+    POST /api/v1/invoices/import-batches/upload/   — Upload & parse .xlsx/.csv file
+    POST /api/v1/invoices/import-batches/{id}/validate/ — Re-validate batch rows
+    POST /api/v1/invoices/import-batches/{id}/commit/   — Commit: auto-create vendors, post invoices, deduct budget
+    GET  /api/v1/invoices/import-batches/          — List past import batches
+    GET  /api/v1/invoices/import-batches/{id}/     — Batch detail with rows & error breakdown
+    """
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_permissions(self):
+        if self.action == "template":
+            return [AllowAny()]
+        return super().get_permissions()
+
+    def _is_tenant_admin(self, user) -> bool:
+        if user.is_superuser:
+            return True
+        from apps.access.models import UserRoleAssignment
+        return UserRoleAssignment.objects.filter(
+            user=user,
+            role__code__in=["tenant_admin", "org_admin"],
+            role__is_active=True,
+        ).exists()
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        if self.action == "template":
+            return
+        if not self._is_tenant_admin(request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Only Tenant Admin users can manage bulk invoice imports.")
+
+    def get_queryset(self):
+        from apps.access.selectors import get_user_visible_org_ids
+        visible_org_ids = get_user_visible_org_ids(self.request.user)
+        return InvoiceImportBatch.objects.filter(org_id__in=visible_org_ids).order_by("-created_at")
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return InvoiceImportBatchListSerializer
+        return InvoiceImportBatchSerializer
+
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {"detail": "Use /import-batches/upload/ to upload a file."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    @action(detail=False, methods=["get"], url_path="template")
+    def template(self, request):
+        """Download styled blank Excel template."""
+        from apps.invoices.import_services import generate_invoice_import_template
+        from django.http import HttpResponse
+        buffer = generate_invoice_import_template()
+        response = HttpResponse(
+            buffer.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = 'attachment; filename="Invoice_Bulk_Import_Template.xlsx"'
+        return response
+
+    @action(detail=False, methods=["post"], url_path="upload")
+    def upload(self, request):
+        """Upload .xlsx/.csv file, parse rows, and create import batch with auto-validation."""
+        from apps.invoices.import_services import (
+            parse_invoice_import_file,
+            create_invoice_import_batch,
+            validate_invoice_import_batch,
+        )
+        from apps.core.models import Organization
+        from apps.access.selectors import get_user_visible_org_ids
+
+        serializer = InvoiceImportUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        uploaded_file = serializer.validated_data["file"]
+        requested_org_id = serializer.validated_data.get("org")
+
+        if requested_org_id:
+            try:
+                org = Organization.objects.get(pk=requested_org_id)
+            except Organization.DoesNotExist:
+                return Response({"detail": "Organization not found."}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            visible_org_ids = get_user_visible_org_ids(request.user)
+            org = Organization.objects.filter(id__in=visible_org_ids).first()
+            if not org:
+                org = Organization.objects.first()
+
+        if not org:
+            return Response({"detail": "No organization context found."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            parsed_rows = parse_invoice_import_file(uploaded_file)
+        except Exception as exc:
+            return Response({"detail": f"Failed to parse file: {str(exc)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not parsed_rows:
+            return Response({"detail": "The uploaded file has no data rows."}, status=status.HTTP_400_BAD_REQUEST)
+
+        batch = create_invoice_import_batch(
+            org=org,
+            file_name=uploaded_file.name,
+            parsed_rows=parsed_rows,
+            user=request.user,
+        )
+
+        batch = validate_invoice_import_batch(batch)
+
+        return Response(InvoiceImportBatchSerializer(batch).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="validate")
+    def validate(self, request, pk=None):
+        """Re-validate batch rows."""
+        from apps.invoices.import_services import validate_invoice_import_batch
+        batch = self.get_object()
+        batch = validate_invoice_import_batch(batch)
+        return Response(InvoiceImportBatchSerializer(batch).data)
+
+    @action(detail=True, methods=["post"], url_path="commit")
+    def commit(self, request, pk=None):
+        """Commit batch: auto-creates vendors, posts invoices, and deducts budgets."""
+        from apps.invoices.import_services import commit_invoice_import_batch
+        batch = self.get_object()
+        if batch.valid_rows == 0:
+            return Response(
+                {"detail": "This batch has 0 valid rows to commit."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        batch = commit_invoice_import_batch(batch, user=request.user)
+        return Response(InvoiceImportBatchSerializer(batch).data)
+
+    @action(detail=True, methods=["post"], url_path="rerun")
+    def rerun(self, request, pk=None):
+        """Re-validate and commit any remaining unposted or previously errored rows in this batch."""
+        from apps.invoices.import_services import rerun_invoice_import_batch
+        batch = self.get_object()
+        batch = rerun_invoice_import_batch(batch, user=request.user)
+        return Response(InvoiceImportBatchSerializer(batch).data)
+

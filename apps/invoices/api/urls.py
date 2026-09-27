@@ -1,13 +1,19 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
-from apps.invoices.api.views import InvoiceViewSet, VendorInvoiceSubmissionViewSet, InvoiceDocumentViewSet
+from apps.invoices.api.views import (
+    InvoiceViewSet,
+    VendorInvoiceSubmissionViewSet,
+    InvoiceDocumentViewSet,
+    InvoiceImportBatchViewSet,
+)
 
 invoice_allocations = InvoiceViewSet.as_view({
     "get": "allocations",
 })
 
 submission_router = DefaultRouter()
+submission_router.register("import-batches", InvoiceImportBatchViewSet, basename="invoice-import-batch")
 submission_router.register("vendor-invoice-submissions", VendorInvoiceSubmissionViewSet, basename="vendor-invoice-submission")
 submission_router.register("invoice-documents", InvoiceDocumentViewSet, basename="invoice-document")
 

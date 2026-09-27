@@ -15,6 +15,8 @@ from apps.vendors.models import (
     VendorProfileRevision,
     VendorSubmissionRoute,
     VendorTrainingVideo,
+    VendorImportBatch,
+    VendorImportRow,
 )
 
 
@@ -322,10 +324,11 @@ class VendorSerializer(serializers.ModelSerializer):
 
 
 class VendorUpdateSerializer(serializers.ModelSerializer):
-    """Allows patching only safe fields."""
+    """Allows patching safe fields."""
     class Meta:
         model = Vendor
-        fields = ["email", "phone"]
+        fields = ["email", "phone", "vendor_name", "sap_vendor_id"]
+
 
 
 # ---------------------------------------------------------------------------
@@ -738,3 +741,102 @@ class SaveDraftRevisionSerializer(serializers.Serializer):
 
 class RejectRevisionSerializer(serializers.Serializer):
     note = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+# ---------------------------------------------------------------------------
+# Vendor Import Batches
+# ---------------------------------------------------------------------------
+
+class VendorImportUploadSerializer(serializers.Serializer):
+    file = serializers.FileField(required=True)
+    org = serializers.IntegerField(required=False)
+
+    def validate_file(self, value):
+        name = value.name.lower()
+        if not (name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".csv")):
+            raise serializers.ValidationError("Only .xlsx, .xls, or .csv files are supported.")
+        if value.size > 25 * 1024 * 1024:
+            raise serializers.ValidationError("File size exceeds the 25 MB limit.")
+        return value
+
+
+class VendorImportRowSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VendorImportRow
+        fields = [
+            "id",
+            "batch",
+            "row_number",
+            "sap_vendor_id",
+            "vendor_name",
+            "scope_node_code",
+            "email",
+            "phone",
+            "pan",
+            "gstin",
+            "gst_registered",
+            "address_line1",
+            "city",
+            "state",
+            "country",
+            "pincode",
+            "bank_name",
+            "account_number",
+            "ifsc",
+            "beneficiary_name",
+            "preferred_payment_mode",
+            "po_mandate_enabled",
+            "status",
+            "error_messages",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class VendorImportBatchSerializer(serializers.ModelSerializer):
+    rows = VendorImportRowSerializer(many=True, read_only=True)
+    uploaded_by_email = serializers.CharField(source="uploaded_by.email", read_only=True, default=None)
+
+    class Meta:
+        model = VendorImportBatch
+        fields = [
+            "id",
+            "org",
+            "file_name",
+            "uploaded_by",
+            "uploaded_by_email",
+            "status",
+            "total_rows",
+            "valid_rows",
+            "error_rows",
+            "created_vendors_count",
+            "updated_vendors_count",
+            "error_summary",
+            "created_at",
+            "updated_at",
+            "rows",
+        ]
+        read_only_fields = fields
+
+
+class VendorImportBatchListSerializer(serializers.ModelSerializer):
+    uploaded_by_email = serializers.CharField(source="uploaded_by.email", read_only=True, default=None)
+
+    class Meta:
+        model = VendorImportBatch
+        fields = [
+            "id",
+            "org",
+            "file_name",
+            "uploaded_by",
+            "uploaded_by_email",
+            "status",
+            "total_rows",
+            "valid_rows",
+            "error_rows",
+            "created_vendors_count",
+            "updated_vendors_count",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
