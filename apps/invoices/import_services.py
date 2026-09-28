@@ -500,20 +500,25 @@ def validate_invoice_import_batch(batch: InvoiceImportBatch) -> InvoiceImportBat
     existing_invoices = list(
         Invoice.objects.filter(scope_node__org=batch.org)
         .exclude(status=InvoiceStatus.REJECTED)
-        .select_related("vendor")
+        .select_related("vendor", "scope_node")
+        .prefetch_related("allocations__category")
     )
+    existing_by_item: Dict[Tuple[str, str, Optional[int], Optional[int]], Invoice] = {}
     existing_by_vendor_inv: Dict[Tuple[str, str], Invoice] = {}
-    existing_by_inv: Dict[str, Invoice] = {}
     existing_by_hist_key: Dict[str, Invoice] = {}
     for inv in existing_invoices:
         if inv.historical_import_key:
             existing_by_hist_key[inv.historical_import_key] = inv
         v_num = _normalize_text(inv.vendor_invoice_number)
-        if v_num:
-            existing_by_inv[v_num] = inv
-            if inv.vendor:
-                v_name_k = _normalize_text(inv.vendor.vendor_name)
-                existing_by_vendor_inv[(v_name_k, v_num)] = inv
+        if v_num and inv.vendor:
+            v_name_k = _normalize_text(inv.vendor.vendor_name)
+            existing_by_vendor_inv[(v_name_k, v_num)] = inv
+            # Index by item key (vendor + invoice_number + scope + category)
+            # so multiple lines of the same invoice across different categories/parks can be imported
+            for alloc in inv.allocations.all():
+                existing_by_item[(v_name_k, v_num, inv.scope_node_id, alloc.category_id)] = inv
+            if not inv.allocations.exists():
+                existing_by_item[(v_name_k, v_num, inv.scope_node_id, None)] = inv
 
     valid_count = 0
     error_count = 0
@@ -655,10 +660,16 @@ def validate_invoice_import_batch(batch: InvoiceImportBatch) -> InvoiceImportBat
 
         existing_match = None
         if inv_num_norm:
-            if (v_name_norm, inv_num_norm) in existing_by_vendor_inv:
-                existing_match = existing_by_vendor_inv[(v_name_norm, inv_num_norm)]
-            elif inv_num_norm in existing_by_inv:
-                existing_match = existing_by_inv[inv_num_norm]
+            item_key = (
+                v_name_norm,
+                inv_num_norm,
+                resolved_scope.id if resolved_scope else None,
+                resolved_cat.id if resolved_cat else None,
+            )
+            if item_key in existing_by_item:
+                existing_match = existing_by_item[item_key]
+            elif (v_name_norm, inv_num_norm, None, None) in existing_by_item:
+                existing_match = existing_by_item[(v_name_norm, inv_num_norm, None, None)]
 
         if existing_match and not errors:
             row.status = InvoiceImportRowStatus.SKIPPED
@@ -809,26 +820,31 @@ def commit_invoice_import_batch(batch: InvoiceImportBatch, user=None) -> Invoice
         if not inv_num:
             inv_num = f"EXP-{slugify(v_name)[:12].upper()}-{row.row_number}"
 
+        target_scope = row.resolved_scope_node or vendor.scope_node
         hist_key = f"bulk:{batch.id}:{row.row_number}:{inv_num}"
         existing_invoice = Invoice.objects.filter(historical_import_key=hist_key).first()
-        if not existing_invoice and inv_num:
-            existing_invoice = Invoice.objects.filter(
-                scope_node__org=batch.org,
+        if not existing_invoice and inv_num and target_scope:
+            existing_qs = Invoice.objects.filter(
+                scope_node=target_scope,
                 vendor=vendor,
                 vendor_invoice_number__iexact=inv_num,
-            ).exclude(status=InvoiceStatus.REJECTED).first()
+            ).exclude(status=InvoiceStatus.REJECTED)
+            if category:
+                existing_qs = existing_qs.filter(allocations__category=category)
+            existing_invoice = existing_qs.first()
 
         if existing_invoice:
             row.created_invoice = existing_invoice
             row.resolved_vendor = vendor
-            row.status = InvoiceImportRowStatus.COMMITTED
-            row.error_messages = []
+            row.status = InvoiceImportRowStatus.SKIPPED
+            row.error_messages = [
+                f"Already posted in system as Invoice #{existing_invoice.id}. Skipped to prevent double deduction."
+            ]
             row.save(update_fields=["created_invoice", "resolved_vendor", "status", "error_messages"])
             continue
 
         title = row.work_description.strip() or f"Invoice {inv_num}"
         amount = row.amount or Decimal("0.00")
-        target_scope = row.resolved_scope_node or vendor.scope_node
 
         # 4. Create Historical Posted Invoice
         invoice = Invoice.objects.create(
@@ -918,10 +934,14 @@ def commit_invoice_import_batch(batch: InvoiceImportBatch, user=None) -> Invoice
         created_invoices += 1
         total_deducted += amount
 
-    # Calculate cumulative batch statistics
-    total_committed_invoices = batch.rows.filter(created_invoice__isnull=False).count()
+    # Calculate cumulative batch statistics (only count invoices newly posted in this batch)
+    committed_rows_qs = batch.rows.filter(
+        created_invoice__isnull=False,
+        status=InvoiceImportRowStatus.COMMITTED,
+    )
+    total_committed_invoices = committed_rows_qs.count()
     total_committed_amount = (
-        batch.rows.filter(created_invoice__isnull=False).aggregate(total=Sum("amount"))["total"]
+        committed_rows_qs.aggregate(total=Sum("amount"))["total"]
         or Decimal("0.00")
     )
     newly_created_vendors_total = (batch.created_vendors_count or 0) + created_vendors
