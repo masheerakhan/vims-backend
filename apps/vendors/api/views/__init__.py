@@ -359,20 +359,37 @@ class VendorAttachmentViewSet(viewsets.ReadOnlyModelViewSet):
         return qs
 
 
+class VendorPagination(viewsets.ModelViewSet.pagination_class or object):
+    pass
+
+
+from rest_framework.pagination import PageNumberPagination
+
+
+class VendorMasterPagination(PageNumberPagination):
+    page_size = 1000
+    page_size_query_param = "page_size"
+    max_page_size = 5000
+
+
 class VendorViewSet(viewsets.ModelViewSet):
     """
     Vendor master CRUD + marketing approval actions.
     Filters: org, scope_node, operational_status, marketing_status, po_mandate_enabled
     """
     permission_classes = [IsAuthenticated]
+    pagination_class = VendorMasterPagination
     http_method_names = ["get", "patch", "post", "head", "options"]
 
     def get_queryset(self):
         from django.db.models import Q
         visible_scope_ids = get_user_visible_scope_ids(self.request.user)
+        visible_org_ids = get_user_visible_org_ids(self.request.user)
         qs = Vendor.objects.select_related(
             "org", "scope_node", "onboarding_submission", "approved_by_marketing"
-        ).filter(scope_node_id__in=visible_scope_ids).order_by("-id")
+        ).filter(
+            Q(org_id__in=visible_org_ids) | Q(scope_node_id__in=visible_scope_ids)
+        ).order_by("vendor_name", "-id")
         params = self.request.query_params
         if search := params.get("search"):
             q_clean = search.strip()
@@ -386,7 +403,10 @@ class VendorViewSet(viewsets.ModelViewSet):
         if scope_node_id := params.get("scope_node"):
             qs = qs.filter(scope_node_id=scope_node_id)
         if op_status := params.get("operational_status"):
-            qs = qs.filter(operational_status=op_status)
+            if op_status != "all":
+                qs = qs.filter(operational_status=op_status)
+        else:
+            qs = qs.exclude(operational_status="inactive")
         if mkt_status := params.get("marketing_status"):
             qs = qs.filter(marketing_status=mkt_status)
         if po_mandate := params.get("po_mandate_enabled"):
@@ -400,8 +420,10 @@ class VendorViewSet(viewsets.ModelViewSet):
 
     def partial_update(self, request, *args, **kwargs):
         vendor = self.get_object()
-        if err := user_can_act_on_scope_response(request.user, vendor.scope_node_id, "update this vendor"):
-            return err
+        visible_org_ids = get_user_visible_org_ids(request.user)
+        if vendor.org_id not in visible_org_ids:
+            if err := user_can_act_on_scope_response(request.user, vendor.scope_node_id, "update this vendor"):
+                return err
         return super().partial_update(request, *args, **kwargs)
 
     @action(detail=True, methods=["post"], url_path="marketing-approve")
@@ -471,7 +493,8 @@ class VendorViewSet(viewsets.ModelViewSet):
             "token_created": result["token_created"],
         })
 
-    def partial_update(self, request, *args, **kwargs):
+    @action(detail=True, methods=["post"], url_path="marketing-reject")
+    def marketing_reject(self, request, pk=None):
         vendor = self.get_object()
         # Actionable scope check on vendor's scope_node
         if err := user_can_act_on_scope_response(request.user, vendor.scope_node_id, "reject vendor marketing"):

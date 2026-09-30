@@ -327,7 +327,7 @@ class VendorUpdateSerializer(serializers.ModelSerializer):
     """Allows patching safe fields."""
     class Meta:
         model = Vendor
-        fields = ["email", "phone", "vendor_name", "sap_vendor_id"]
+        fields = ["email", "phone", "vendor_name", "sap_vendor_id", "operational_status"]
 
 
 
