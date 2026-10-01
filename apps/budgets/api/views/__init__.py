@@ -777,13 +777,22 @@ class BudgetConsumptionViewSet(ModelViewSet):
 
     def get_queryset(self):
         visible_scope_ids = get_user_visible_scope_ids(self.request.user)
-        qs = BudgetConsumption.objects.select_related("budget", "budget_line", "created_by").filter(
+        qs = BudgetConsumption.objects.select_related(
+            "budget",
+            "budget__scope_node",
+            "budget_line",
+            "budget_line__category",
+            "budget_line__subcategory",
+            "created_by",
+        ).filter(
             budget__scope_node_id__in=visible_scope_ids
         ).order_by("-created_at")
         budget_id = self.request.query_params.get("budget")
         budget_line_id = self.request.query_params.get("budget_line")
         source_type = self.request.query_params.get("source_type")
         source_id = self.request.query_params.get("source_id")
+        category = self.request.query_params.get("category")
+        subcategory = self.request.query_params.get("subcategory")
         if budget_id:
             qs = qs.filter(budget_id=budget_id)
         if budget_line_id:
@@ -792,7 +801,46 @@ class BudgetConsumptionViewSet(ModelViewSet):
             qs = qs.filter(source_type=source_type)
         if source_id:
             qs = qs.filter(source_id=source_id)
+        if category:
+            cat_ids = [c.strip() for c in category.split(",") if c.strip()]
+            if cat_ids:
+                qs = qs.filter(budget_line__category_id__in=cat_ids)
+        if subcategory:
+            sub_ids = [s.strip() for s in subcategory.split(",") if s.strip()]
+            if sub_ids:
+                qs = qs.filter(budget_line__subcategory_id__in=sub_ids)
+        date_from = self.request.query_params.get("date_from")
+        date_to = self.request.query_params.get("date_to")
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
         return qs
+
+    def get_serializer(self, *args, **kwargs):
+        if kwargs.get("many") and args:
+            items = list(args[0])
+            args = (items, *args[1:])
+            invoice_ids = [
+                int(c.source_id)
+                for c in items
+                if getattr(c, "source_type", None) == "invoice"
+                and getattr(c, "source_id", None)
+                and str(c.source_id).isdigit()
+            ]
+            invoice_map = {}
+            if invoice_ids:
+                from apps.invoices.models import Invoice
+                for inv in (
+                    Invoice.objects
+                    .select_related("vendor", "scope_node")
+                    .filter(id__in=set(invoice_ids))
+                ):
+                    invoice_map[str(inv.id)] = inv
+            ctx = dict(kwargs.get("context") or self.get_serializer_context())
+            ctx["invoice_map"] = invoice_map
+            kwargs["context"] = ctx
+        return super().get_serializer(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------

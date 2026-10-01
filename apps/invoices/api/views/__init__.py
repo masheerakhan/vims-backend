@@ -44,8 +44,29 @@ from apps.invoices.selectors import (
 from apps.dashboard.services import get_invoice_control_tower_payload
 
 
+from rest_framework.pagination import PageNumberPagination
+
+
+class InvoicePagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 5000
+
+    def get_paginated_response(self, data):
+        return Response({
+            "count": self.page.paginator.count,
+            "total_pages": self.page.paginator.num_pages,
+            "page": self.page.number,
+            "page_size": self.get_page_size(self.request),
+            "next": self.get_next_link(),
+            "previous": self.get_previous_link(),
+            "results": data,
+        })
+
+
 class InvoiceViewSet(ModelViewSet):
     permission_classes = [IsAuthenticated]
+    pagination_class = InvoicePagination
 
     def _apply_scope_filter(self, qs, node_id: str | None):
         if not node_id:
@@ -75,6 +96,21 @@ class InvoiceViewSet(ModelViewSet):
             | Q(vendor__vendor_name__icontains=search_term)
         )
 
+    def _apply_quick_filter(self, qs, quick_filter: str | None):
+        if not quick_filter or quick_filter == "all":
+            return qs
+        if quick_filter == "active":
+            return qs.exclude(status__in=["paid", "rejected"])
+        if quick_filter == "historical":
+            return qs.filter(status__in=["historical_posted", "historical_reversed"])
+        if quick_filter == "finance":
+            return qs.filter(status__in=["finance_pending", "finance_approved", "finance_rejected"])
+        if quick_filter == "attention":
+            return qs.filter(status__in=["pending", "in_review", "finance_pending", "internally_approved"])
+        if quick_filter == "paid":
+            return qs.filter(status="paid")
+        return qs
+
     def get_queryset(self):
         """
         Return only invoices the current user can read:
@@ -82,16 +118,18 @@ class InvoiceViewSet(ModelViewSet):
         - invoices at scope nodes where they have READ permission
           at the node or any ancestor.
         """
-        qs = Invoice.objects.select_related("scope_node", "created_by", "vendor").order_by("-created_at")
+        qs = Invoice.objects.select_related("scope_node", "created_by", "vendor").order_by("-created_at", "-id")
 
         node_id = self.request.query_params.get("scope_node")
         invoice_status = self.request.query_params.get("status")
+        quick_filter = self.request.query_params.get("quick_filter")
         entry_source = self.request.query_params.get("entry_source")
         vendor_id = self.request.query_params.get("vendor")
         search_term = self.request.query_params.get("search")
         qs = self._apply_scope_filter(qs, node_id)
         if invoice_status:
             qs = qs.filter(status=invoice_status)
+        qs = self._apply_quick_filter(qs, quick_filter)
         if entry_source:
             qs = qs.filter(entry_source=entry_source)
         if vendor_id:

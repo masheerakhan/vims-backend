@@ -385,13 +385,115 @@ class BudgetRuleCreateSerializer(serializers.ModelSerializer):
 # ---------------------------------------------------------------------------
 
 class BudgetConsumptionSerializer(serializers.ModelSerializer):
+    budget_name = serializers.CharField(source="budget.name", read_only=True)
+    scope_node = serializers.PrimaryKeyRelatedField(source="budget.scope_node", read_only=True)
+    scope_node_name = serializers.CharField(
+        source="budget.scope_node.name", read_only=True, allow_null=True, default=None
+    )
+    category = serializers.PrimaryKeyRelatedField(
+        source="budget_line.category", read_only=True, allow_null=True, default=None
+    )
+    category_name = serializers.CharField(
+        source="budget_line.category.name", read_only=True, allow_null=True, default=None
+    )
+    subcategory = serializers.PrimaryKeyRelatedField(
+        source="budget_line.subcategory", read_only=True, allow_null=True, default=None
+    )
+    subcategory_name = serializers.CharField(
+        source="budget_line.subcategory.name", read_only=True, allow_null=True, default=None
+    )
+    vendor_id = serializers.SerializerMethodField()
+    vendor_name = serializers.SerializerMethodField()
+    sap_vendor_id = serializers.SerializerMethodField()
+    invoice_title = serializers.SerializerMethodField()
+    vendor_invoice_number = serializers.SerializerMethodField()
+    invoice_status = serializers.SerializerMethodField()
+    invoice_details = serializers.SerializerMethodField()
+
     class Meta:
         model = BudgetConsumption
         fields = (
-            "id", "budget", "budget_line", "source_type", "source_id", "amount",
+            "id", "budget", "budget_name", "scope_node", "scope_node_name",
+            "budget_line", "category", "category_name", "subcategory", "subcategory_name",
+            "source_type", "source_id", "amount",
             "consumption_type", "status", "created_by", "note", "created_at",
+            "vendor_id", "vendor_name", "sap_vendor_id",
+            "invoice_title", "vendor_invoice_number", "invoice_status",
+            "invoice_details",
         )
         read_only_fields = fields
+
+    def _resolve_invoice(self, obj):
+        if obj.source_type != "invoice" or not obj.source_id:
+            return None
+        cacheAttr = "_cached_invoice_obj"
+        if hasattr(obj, cacheAttr):
+            return getattr(obj, cacheAttr)
+        invoice_map = self.context.get("invoice_map")
+        if invoice_map is not None:
+            inv = invoice_map.get(str(obj.source_id))
+            setattr(obj, cacheAttr, inv)
+            return inv
+        if not str(obj.source_id).isdigit():
+            setattr(obj, cacheAttr, None)
+            return None
+        from apps.invoices.models import Invoice
+        inv = (
+            Invoice.objects
+            .select_related("vendor", "scope_node")
+            .filter(pk=int(obj.source_id))
+            .first()
+        )
+        setattr(obj, cacheAttr, inv)
+        return inv
+
+    def get_vendor_id(self, obj):
+        inv = self._resolve_invoice(obj)
+        return inv.vendor_id if inv else None
+
+    def get_vendor_name(self, obj):
+        inv = self._resolve_invoice(obj)
+        return inv.vendor.vendor_name if inv and inv.vendor else None
+
+    def get_sap_vendor_id(self, obj):
+        inv = self._resolve_invoice(obj)
+        return inv.vendor.sap_vendor_id if inv and inv.vendor else None
+
+    def get_invoice_title(self, obj):
+        inv = self._resolve_invoice(obj)
+        return inv.title if inv else None
+
+    def get_vendor_invoice_number(self, obj):
+        inv = self._resolve_invoice(obj)
+        return inv.vendor_invoice_number if inv else None
+
+    def get_invoice_status(self, obj):
+        inv = self._resolve_invoice(obj)
+        return inv.status if inv else None
+
+    def get_invoice_details(self, obj):
+        inv = self._resolve_invoice(obj)
+        if not inv:
+            return None
+        return {
+            "id": inv.id,
+            "title": inv.title,
+            "vendor_id": inv.vendor_id,
+            "vendor_name": inv.vendor.vendor_name if inv.vendor else None,
+            "sap_vendor_id": inv.vendor.sap_vendor_id if inv.vendor else None,
+            "vendor_invoice_number": inv.vendor_invoice_number or "",
+            "invoice_date": str(inv.invoice_date) if inv.invoice_date else None,
+            "due_date": str(inv.due_date) if inv.due_date else None,
+            "po_number": inv.po_number or "",
+            "amount": str(inv.amount),
+            "subtotal_amount": str(inv.subtotal_amount) if inv.subtotal_amount is not None else None,
+            "tax_amount": str(inv.tax_amount) if inv.tax_amount is not None else None,
+            "currency": inv.currency,
+            "status": inv.status,
+            "description": inv.description or "",
+            "scope_node_name": inv.scope_node.name if inv.scope_node else None,
+            "created_at": inv.created_at.isoformat() if inv.created_at else None,
+        }
 
 
 # ---------------------------------------------------------------------------
