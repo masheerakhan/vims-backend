@@ -968,6 +968,59 @@ class VendorInvoiceSubmissionViewSet(ViewSet):
         serializer = VendorInvoiceSubmissionSerializer(qs, many=True)
         return Response(serializer.data)
 
+    @action(detail=False, methods=["get"], url_path="on-behalf-invoices")
+    def on_behalf_invoices(self, request):
+        """
+        GET /api/v1/invoices/vendor-invoice-submissions/on-behalf-invoices/
+        Returns all Invoice records linked to the current vendor that were created/imported
+        on behalf of the vendor (e.g. historical imports or internal creations) and are not
+        already represented by a VendorInvoiceSubmission row.
+        """
+        assignment = self._get_vendor_assignment()
+        if not assignment:
+            return Response([])
+
+        submitted_final_invoice_ids = set(
+            VendorInvoiceSubmission.objects
+            .filter(vendor=assignment.vendor, final_invoice_id__isnull=False)
+            .values_list("final_invoice_id", flat=True)
+        )
+
+        invoices_qs = (
+            Invoice.objects
+            .select_related("vendor", "scope_node")
+            .filter(vendor=assignment.vendor)
+            .exclude(id__in=submitted_final_invoice_ids)
+            .order_by("-invoice_date", "-created_at", "-id")
+        )
+
+        results = []
+        for inv in invoices_qs:
+            results.append({
+                "id": str(inv.id),
+                "title": inv.title,
+                "vendor": str(inv.vendor_id) if inv.vendor_id else None,
+                "vendor_name": inv.vendor.vendor_name if inv.vendor else "",
+                "scope_node": str(inv.scope_node_id) if inv.scope_node_id else "",
+                "scope_node_name": inv.scope_node.name if inv.scope_node else "",
+                "status": inv.status,
+                "entry_source": inv.entry_source,
+                "vendor_invoice_number": inv.vendor_invoice_number or "",
+                "po_number": inv.po_number or "",
+                "finance_reference_number": inv.finance_reference_number or "",
+                "invoice_date": str(inv.invoice_date) if inv.invoice_date else None,
+                "due_date": str(inv.due_date) if inv.due_date else None,
+                "subtotal_amount": str(inv.subtotal_amount) if inv.subtotal_amount is not None else None,
+                "tax_amount": str(inv.tax_amount) if inv.tax_amount is not None else None,
+                "amount": str(inv.amount),
+                "currency": inv.currency or "INR",
+                "description": inv.description or "",
+                "historical_posted_at": inv.historical_posted_at.isoformat() if inv.historical_posted_at else None,
+                "created_at": inv.created_at.isoformat() if inv.created_at else None,
+                "updated_at": inv.updated_at.isoformat() if inv.updated_at else None,
+            })
+        return Response(results)
+
     def retrieve(self, request, pk=None):
         """
         GET /api/v1/vendor-invoice-submissions/{id}/

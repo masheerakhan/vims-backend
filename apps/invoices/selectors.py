@@ -25,10 +25,17 @@ def user_can_access_invoice(user, invoice):
 
     User may access an invoice if ANY of:
       1. They are the invoice creator
-      2. They have READ permission on INVOICE at invoice.scope_node or any ancestor
+      2. They are an active vendor user assigned to invoice.vendor
+      3. They have READ permission on INVOICE at invoice.scope_node or any ancestor
     """
     if invoice.created_by_id == user.pk:
         return True
+    if invoice.vendor_id:
+        from apps.vendors.models import UserVendorAssignment
+        if UserVendorAssignment.objects.filter(
+            user=user, vendor_id=invoice.vendor_id, is_active=True
+        ).exists():
+            return True
     from apps.access.services import user_has_permission_including_ancestors
     return user_has_permission_including_ancestors(
         user, PermissionAction.READ, PermissionResource.INVOICE, invoice.scope_node
