@@ -1,5 +1,5 @@
 from django.urls import path, include
-from rest_framework.routers import DefaultRouter
+from rest_framework.routers import DefaultRouter, SimpleRouter
 
 from apps.vendors.api.views import (
     MyVendorView,
@@ -43,7 +43,8 @@ router.register("send-to-options", VendorSubmissionRouteViewSet, basename="vendo
 router.register("", VendorViewSet, basename="vendor")
 
 # Nested router: /api/v1/vendors/{vendor_pk}/profile-revisions/
-revision_router = DefaultRouter()
+# Must use SimpleRouter so it does not register an APIRootView at /api/v1/vendors/<int:vendor_pk>/
+revision_router = SimpleRouter()
 revision_router.register("profile-revisions", VendorProfileRevisionViewSet, basename="vendorprofilerevision")
 
 urlpatterns = [
