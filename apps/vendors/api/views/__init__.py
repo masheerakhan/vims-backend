@@ -43,6 +43,8 @@ from apps.vendors.services import (
     remove_submission_attachment,
     reopen_submission,
     send_submission_to_finance,
+    update_invitation_email,
+    update_submission_email,
 )
 from apps.vendors.route_services import (
     RouteAssigneeReplacementError,
@@ -72,9 +74,11 @@ from apps.vendors.api.serializers import (
     VendorAttachmentSerializer,
     VendorInvitationCreateSerializer,
     VendorInvitationSerializer,
+    VendorInvitationUpdateSerializer,
     VendorProfileRevisionListSerializer,
     VendorProfileRevisionSerializer,
     VendorSerializer,
+    VendorSubmissionEmailUpdateSerializer,
     VendorSubmissionSerializer,
     VendorUpdateSerializer,
     VendorSubmissionRouteSerializer,
@@ -100,7 +104,7 @@ class VendorInvitationViewSet(viewsets.ModelViewSet):
     Filters: org, scope_node, status, vendor_email
     """
     permission_classes = [IsAuthenticated]
-    http_method_names = ["get", "post", "head", "options"]
+    http_method_names = ["get", "post", "patch", "head", "options"]
 
     def get_queryset(self):
         visible_scope_ids = get_user_visible_scope_ids(self.request.user)
@@ -121,6 +125,8 @@ class VendorInvitationViewSet(viewsets.ModelViewSet):
     def get_serializer_class(self):
         if self.action == "create":
             return VendorInvitationCreateSerializer
+        if self.action == "partial_update":
+            return VendorInvitationUpdateSerializer
         return VendorInvitationSerializer
 
     def create(self, request, *args, **kwargs):
@@ -140,6 +146,27 @@ class VendorInvitationViewSet(viewsets.ModelViewSet):
             expires_at=d.get("expires_at"),
         )
         return Response(VendorInvitationSerializer(invitation).data, status=status.HTTP_201_CREATED)
+
+    def partial_update(self, request, *args, **kwargs):
+        invitation = self.get_object()
+        visible_org_ids = get_user_visible_org_ids(request.user)
+        if invitation.org_id not in visible_org_ids:
+            if err := user_can_act_on_scope_response(request.user, invitation.scope_node_id, "update this invitation"):
+                return err
+        serializer = VendorInvitationUpdateSerializer(invitation, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        d = serializer.validated_data
+        try:
+            updated = update_invitation_email(
+                invitation=invitation,
+                new_email=d.get("vendor_email", invitation.vendor_email),
+                vendor_name_hint=d.get("vendor_name_hint"),
+                resend=bool(d.get("resend_email", False)),
+                actor=request.user,
+            )
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VendorInvitationSerializer(updated).data)
 
     @action(detail=True, methods=["post"], url_path="cancel")
     def cancel(self, request, pk=None):
@@ -341,6 +368,31 @@ class VendorSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(VendorSubmissionSerializer(updated).data)
 
 
+    @action(detail=True, methods=["patch", "post"], url_path="update-email")
+    def update_email(self, request, pk=None):
+        """PATCH/POST /api/v1/vendors/submissions/{id}/update-email/"""
+        submission = self.get_object()
+        visible_org_ids = get_user_visible_org_ids(request.user)
+        can_act_as_finance = self._can_current_user_act_as_finance(request, submission)
+        if submission.invitation.org_id not in visible_org_ids and not can_act_as_finance:
+            if err := user_can_act_on_scope_response(
+                request.user, submission.invitation.scope_node_id, "update submission email"
+            ):
+                return err
+
+        serializer = VendorSubmissionEmailUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            updated = update_submission_email(
+                submission=submission,
+                new_email=serializer.validated_data["email"],
+                actor=request.user,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VendorSubmissionSerializer(updated).data)
+
+
 class VendorAttachmentViewSet(viewsets.ReadOnlyModelViewSet):
     """
     Internal read-only attachment listing.
@@ -403,7 +455,8 @@ class VendorViewSet(viewsets.ModelViewSet):
             qs = qs.filter(
                 Q(vendor_name__icontains=q_clean) |
                 Q(sap_vendor_id__icontains=q_clean) |
-                Q(email__icontains=q_clean)
+                Q(email__icontains=q_clean) |
+                Q(portal_email__icontains=q_clean)
             )
         if org_id := params.get("org"):
             qs = qs.filter(org_id=org_id)
@@ -431,7 +484,15 @@ class VendorViewSet(viewsets.ModelViewSet):
         if vendor.org_id not in visible_org_ids:
             if err := user_can_act_on_scope_response(request.user, vendor.scope_node_id, "update this vendor"):
                 return err
-        return super().partial_update(request, *args, **kwargs)
+        serializer = VendorUpdateSerializer(
+            vendor,
+            data=request.data,
+            partial=True,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        updated_vendor = serializer.save()
+        return Response(VendorSerializer(updated_vendor).data)
 
     @action(detail=True, methods=["post"], url_path="marketing-approve")
     def marketing_approve(self, request, pk=None):

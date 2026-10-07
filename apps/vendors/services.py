@@ -1870,16 +1870,39 @@ def ensure_vendor_portal_user(vendor: Vendor):
     """
     Create or reuse a portal user for vendor.email.
     User is always active (usable after password is set).
-    Returns (user, created).
+    Returns (user, created, vendor_email).
     """
     from django.contrib.auth import get_user_model
     User = get_user_model()
-    vendor_email = get_vendor_email(vendor)
-    user, created = User.objects.get_or_create(
-        email=vendor_email,
-        defaults={"is_active": True},
+    vendor_email = get_vendor_email(vendor).strip().lower()
+
+    # If vendor already has an active assignment or cached portal_user_id, keep that user's email in sync
+    existing_assignment = (
+        UserVendorAssignment.objects
+        .filter(vendor=vendor, is_active=True)
+        .select_related("user")
+        .first()
     )
-    if not user.is_active:
+    if existing_assignment and existing_assignment.user:
+        linked_user = existing_assignment.user
+        if linked_user.email.strip().lower() != vendor_email:
+            conflict_exists = User.objects.filter(email__iexact=vendor_email).exclude(pk=linked_user.pk).exists()
+            shared_assignment = (
+                UserVendorAssignment.objects
+                .filter(user=linked_user, is_active=True)
+                .exclude(vendor=vendor)
+                .exists()
+            )
+            if not conflict_exists and not shared_assignment and not linked_user.is_staff and not linked_user.is_superuser:
+                linked_user.email = vendor_email
+                linked_user.save(update_fields=["email", "updated_at"])
+
+    user = User.objects.filter(email__iexact=vendor_email).first()
+    created = False
+    if user is None:
+        user = User.objects.create(email=vendor_email, is_active=True)
+        created = True
+    elif not user.is_active:
         user.is_active = True
         user.save(update_fields=["is_active"])
     return user, created, vendor_email
@@ -1887,12 +1910,233 @@ def ensure_vendor_portal_user(vendor: Vendor):
 
 def ensure_vendor_portal_assignment(vendor: Vendor, user) -> tuple:
     """Create or reactivate UserVendorAssignment. Returns (assignment, created)."""
+    # Deactivate any stale assignments for this vendor pointing to other users
+    UserVendorAssignment.objects.filter(vendor=vendor, is_active=True).exclude(user=user).update(is_active=False)
     assignment, created = UserVendorAssignment.objects.update_or_create(
         user=user,
         vendor=vendor,
         defaults={"is_active": True},
     )
     return assignment, created
+
+
+@transaction.atomic
+def sync_vendor_email_change(vendor: Vendor, new_email: str, actor=None) -> Vendor:
+    """
+    Update a vendor's email address and synchronize portal login user & onboarding records.
+    """
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+
+    cleaned_email = (new_email or "").strip().lower()
+    old_email = (vendor.email or "").strip()
+
+    if cleaned_email:
+        try:
+            validate_email(cleaned_email)
+        except ValidationError as exc:
+            raise ValueError("Enter a valid email address.") from exc
+
+    # Locate current linked portal user if any
+    active_assignment = (
+        UserVendorAssignment.objects
+        .filter(vendor=vendor, is_active=True)
+        .select_related("user")
+        .first()
+    )
+    current_portal_user = active_assignment.user if active_assignment else None
+    if current_portal_user is None and vendor.portal_user_id and str(vendor.portal_user_id).isdigit():
+        current_portal_user = User.objects.filter(pk=int(vendor.portal_user_id)).first()
+
+    if cleaned_email:
+        existing_email_user = User.objects.filter(email__iexact=cleaned_email).first()
+        if existing_email_user and (
+            current_portal_user is None or existing_email_user.pk != current_portal_user.pk
+        ):
+            has_other_vendor = (
+                UserVendorAssignment.objects
+                .filter(user=existing_email_user, is_active=True)
+                .exclude(vendor=vendor)
+                .exists()
+            )
+            has_internal_roles = (
+                existing_email_user.is_staff
+                or existing_email_user.is_superuser
+                or getattr(existing_email_user, "role_assignments", None) is not None
+                and existing_email_user.role_assignments.exists()
+            )
+            if has_other_vendor or has_internal_roles:
+                raise ValueError(f"Email '{cleaned_email}' is already associated with another user account.")
+
+        if current_portal_user is not None:
+            if existing_email_user is None or existing_email_user.pk == current_portal_user.pk:
+                shared_with_other_vendor = (
+                    UserVendorAssignment.objects
+                    .filter(user=current_portal_user, is_active=True)
+                    .exclude(vendor=vendor)
+                    .exists()
+                )
+                is_internal = (
+                    current_portal_user.is_staff
+                    or current_portal_user.is_superuser
+                    or (
+                        getattr(current_portal_user, "role_assignments", None) is not None
+                        and current_portal_user.role_assignments.exists()
+                    )
+                )
+                if not shared_with_other_vendor and not is_internal:
+                    if current_portal_user.email != cleaned_email:
+                        current_portal_user.email = cleaned_email
+                        current_portal_user.save(update_fields=["email", "updated_at"])
+                    ensure_vendor_portal_assignment(vendor, current_portal_user)
+                    vendor.portal_user_id = str(current_portal_user.pk)
+                    vendor.portal_email = cleaned_email
+                else:
+                    new_user = User.objects.create(email=cleaned_email, is_active=True)
+                    ensure_vendor_portal_assignment(vendor, new_user)
+                    vendor.portal_user_id = str(new_user.pk)
+                    vendor.portal_email = cleaned_email
+            else:
+                # Re-bind vendor to existing unassigned portal user with cleaned_email
+                if not existing_email_user.is_active:
+                    existing_email_user.is_active = True
+                    existing_email_user.save(update_fields=["is_active"])
+                ensure_vendor_portal_assignment(vendor, existing_email_user)
+                vendor.portal_user_id = str(existing_email_user.pk)
+                vendor.portal_email = cleaned_email
+        else:
+            if vendor.portal_email:
+                vendor.portal_email = cleaned_email
+
+        # Keep linked onboarding submission and invitation email in sync
+        if vendor.onboarding_submission_id:
+            sub = vendor.onboarding_submission
+            if sub:
+                sub.normalized_email = cleaned_email
+                raw = dict(sub.raw_form_data or {})
+                raw["email"] = cleaned_email
+                raw["Email Id"] = cleaned_email
+                sub.raw_form_data = raw
+                sub.save(update_fields=["normalized_email", "raw_form_data", "updated_at"])
+                if sub.invitation_id:
+                    VendorInvitation.objects.filter(pk=sub.invitation_id).update(
+                        vendor_email=cleaned_email,
+                        updated_at=timezone.now(),
+                    )
+    else:
+        vendor.portal_email = ""
+
+    vendor.email = cleaned_email
+    vendor.save(update_fields=["email", "portal_email", "portal_user_id", "updated_at"])
+
+    if old_email.lower() != cleaned_email:
+        _build_audit_log(
+            user=actor,
+            action="vendor_email_updated",
+            resource_type="Vendor",
+            resource_id=vendor.pk,
+            metadata={"old_email": old_email, "new_email": cleaned_email},
+        )
+
+    return vendor
+
+
+@transaction.atomic
+def update_invitation_email(
+    invitation: VendorInvitation,
+    new_email: str,
+    vendor_name_hint: str | None = None,
+    resend: bool = False,
+    actor=None,
+) -> VendorInvitation:
+    """
+    Allow an admin to update the email address on a vendor invitation
+    and sync any linked submissions/vendors. Optionally resends the invite email.
+    """
+    cleaned_email = (new_email or "").strip().lower()
+    if not cleaned_email:
+        raise ValueError("Vendor email is required.")
+    try:
+        validate_email(cleaned_email)
+    except ValidationError as exc:
+        raise ValueError("Enter a valid email address.") from exc
+
+    old_email = invitation.vendor_email
+    invitation.vendor_email = cleaned_email
+    update_fields = ["vendor_email", "updated_at"]
+    if vendor_name_hint is not None:
+        invitation.vendor_name_hint = vendor_name_hint.strip()
+        update_fields.append("vendor_name_hint")
+    invitation.save(update_fields=update_fields)
+
+    for sub in invitation.submissions.all():
+        sub.normalized_email = cleaned_email
+        raw = dict(sub.raw_form_data or {})
+        raw["email"] = cleaned_email
+        raw["Email Id"] = cleaned_email
+        sub.raw_form_data = raw
+        sub.save(update_fields=["normalized_email", "raw_form_data", "updated_at"])
+        if hasattr(sub, "vendor") and sub.vendor:
+            sync_vendor_email_change(sub.vendor, cleaned_email, actor=actor)
+
+    _build_audit_log(
+        user=actor,
+        action="vendor_invitation_email_updated",
+        resource_type="VendorInvitation",
+        resource_id=invitation.pk,
+        metadata={"old_email": old_email, "new_email": cleaned_email, "resend": resend},
+    )
+
+    if resend and invitation.status in (InvitationStatus.PENDING, InvitationStatus.OPENED):
+        _send_invitation_email(invitation, actor)
+
+    return invitation
+
+
+@transaction.atomic
+def update_submission_email(
+    submission: VendorOnboardingSubmission,
+    new_email: str,
+    actor=None,
+) -> VendorOnboardingSubmission:
+    """
+    Allow an admin to update the vendor email on an onboarding submission,
+    keeping the linked invitation and any created Vendor record in sync.
+    """
+    cleaned_email = (new_email or "").strip().lower()
+    if not cleaned_email:
+        raise ValueError("Vendor email is required.")
+    try:
+        validate_email(cleaned_email)
+    except ValidationError as exc:
+        raise ValueError("Enter a valid email address.") from exc
+
+    old_email = submission.normalized_email
+    submission.normalized_email = cleaned_email
+    raw = dict(submission.raw_form_data or {})
+    raw["email"] = cleaned_email
+    raw["Email Id"] = cleaned_email
+    submission.raw_form_data = raw
+    submission.save(update_fields=["normalized_email", "raw_form_data", "updated_at"])
+
+    if submission.invitation_id:
+        VendorInvitation.objects.filter(pk=submission.invitation_id).update(
+            vendor_email=cleaned_email,
+            updated_at=timezone.now(),
+        )
+
+    vendor = Vendor.objects.filter(onboarding_submission=submission).first()
+    if vendor:
+        sync_vendor_email_change(vendor, cleaned_email, actor=actor)
+
+    _build_audit_log(
+        user=actor,
+        action="vendor_submission_email_updated",
+        resource_type="VendorOnboardingSubmission",
+        resource_id=submission.pk,
+        metadata={"old_email": old_email, "new_email": cleaned_email},
+    )
+    return submission
 
 
 def create_vendor_activation_token(user, vendor, vendor_email: str, actor=None):
@@ -2657,6 +2901,8 @@ def apply_vendor_profile_revision(revision: VendorProfileRevision, actor=None) -
     revision.save(update_fields=["status", "applied_at", "updated_by", "updated_at"])
 
     _lift_vendor_profile_hold(vendor, extra_update_fields=update_fields)
+    if "email" in update_fields:
+        sync_vendor_email_change(vendor, vendor.email, actor=actor)
 
     _build_audit_log(
         user=actor,

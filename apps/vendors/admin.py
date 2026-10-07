@@ -48,11 +48,17 @@ class VendorFinanceDecisionAdmin(admin.ModelAdmin):
 
 @admin.register(Vendor)
 class VendorAdmin(admin.ModelAdmin):
-    list_display = ("id", "vendor_name", "email", "sap_vendor_id", "operational_status", "marketing_status", "po_mandate_enabled", "org", "created_at")
+    list_display = ("id", "vendor_name", "email", "portal_email", "sap_vendor_id", "operational_status", "marketing_status", "po_mandate_enabled", "org", "created_at")
     list_filter = ("operational_status", "marketing_status", "po_mandate_enabled")
-    search_fields = ("vendor_name", "email", "sap_vendor_id")
+    search_fields = ("vendor_name", "email", "portal_email", "sap_vendor_id")
     raw_id_fields = ("org", "scope_node", "onboarding_submission", "approved_by_marketing")
     readonly_fields = ("created_at", "updated_at")
+
+    def save_model(self, request, obj, form, change):
+        super().save_model(request, obj, form, change)
+        if change and "email" in form.changed_data:
+            from .services import sync_vendor_email_change
+            sync_vendor_email_change(obj, obj.email, actor=request.user)
 
 
 @admin.register(VendorTrainingVideo)

@@ -66,6 +66,47 @@ class VendorInvitationCreateSerializer(serializers.ModelSerializer):
         fields = ["org", "scope_node", "vendor_email", "vendor_name_hint", "expires_at"]
 
 
+class VendorInvitationUpdateSerializer(serializers.Serializer):
+    vendor_email = serializers.EmailField(required=True)
+    vendor_name_hint = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    resend_email = serializers.BooleanField(required=False, default=False)
+
+    def validate_vendor_email(self, value):
+        email = (value or "").strip().lower()
+        instance = self.instance
+        if not email:
+            raise serializers.ValidationError("Vendor email is required.")
+
+        vendor_qs = Vendor.objects.filter(email__iexact=email)
+        if instance is not None:
+            vendor_qs = vendor_qs.exclude(onboarding_submission__invitation=instance)
+        if vendor_qs.exists():
+            raise serializers.ValidationError("A vendor with this email is already registered.")
+
+        active_invite_statuses = (
+            InvitationStatus.PENDING,
+            InvitationStatus.OPENED,
+            InvitationStatus.SUBMITTED,
+        )
+        inv_qs = VendorInvitation.objects.filter(
+            vendor_email__iexact=email,
+            status__in=active_invite_statuses,
+        )
+        if instance is not None:
+            inv_qs = inv_qs.exclude(pk=instance.pk)
+        if inv_qs.exists():
+            raise serializers.ValidationError("An active invitation already exists for this email.")
+
+        return email
+
+
+class VendorSubmissionEmailUpdateSerializer(serializers.Serializer):
+    email = serializers.EmailField(required=True)
+
+    def validate_email(self, value):
+        return (value or "").strip().lower()
+
+
 # ---------------------------------------------------------------------------
 # VendorOnboardingSubmission
 # ---------------------------------------------------------------------------
@@ -324,10 +365,48 @@ class VendorSerializer(serializers.ModelSerializer):
 
 
 class VendorUpdateSerializer(serializers.ModelSerializer):
-    """Allows patching safe fields."""
+    """Allows patching safe fields and synchronizes vendor email with portal access."""
     class Meta:
         model = Vendor
         fields = ["email", "phone", "vendor_name", "sap_vendor_id", "operational_status"]
+
+    def validate_email(self, value):
+        email = (value or "").strip().lower()
+        if email and self.instance is not None:
+            conflict = (
+                Vendor.objects
+                .filter(email__iexact=email)
+                .exclude(pk=self.instance.pk)
+                .exclude(operational_status="inactive")
+                .exists()
+            )
+            if conflict:
+                raise serializers.ValidationError("Another active vendor already uses this email address.")
+        return email
+
+    def update(self, instance, validated_data):
+        from apps.vendors.services import sync_vendor_email_change
+
+        has_email = "email" in validated_data
+        new_email = validated_data.pop("email", None)
+
+        update_fields = []
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+            update_fields.append(attr)
+        if update_fields:
+            update_fields.append("updated_at")
+            instance.save(update_fields=update_fields)
+
+        if has_email:
+            request = self.context.get("request")
+            actor = getattr(request, "user", None) if request else None
+            try:
+                sync_vendor_email_change(instance, new_email or "", actor=actor)
+            except ValueError as exc:
+                raise serializers.ValidationError({"email": str(exc)}) from exc
+
+        return instance
 
 
 
