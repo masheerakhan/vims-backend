@@ -21,6 +21,8 @@ All functions are mockable in tests via the standard patch path:
 import logging
 from typing import TYPE_CHECKING
 from django.conf import settings
+from django.core.mail import EmailMessage
+from apps.vendors.email import send_vendor_invitation_email, send_finance_email
 
 if TYPE_CHECKING:
     from apps.vendors.models import VendorInvitation, VendorOnboardingSubmission, Vendor
@@ -191,15 +193,12 @@ def send_vendor_invitation_notification(invitation: "VendorInvitation") -> None:
         Logs and propagates no exception — caller decides how to handle failure.
     """
     try:
-        from apps.vendors.email import send_vendor_invitation_email
-        from django.conf import settings
-
         portal_base = getattr(settings, "VENDOR_PORTAL_BASE_URL", "http://localhost:5173")
         onboarding_url = f"{portal_base}/vendor/onboarding/{invitation.token}"
 
         invited_by = getattr(invitation, "invited_by", None)
-        if invited_by:
-            invited_by_name = invited_by.get_full_name().strip() or invited_by.email
+        if invited_by and hasattr(invited_by, "get_full_name"):
+            invited_by_name = invited_by.get_full_name().strip() or getattr(invited_by, "email", "")
         else:
             invited_by_name = "Horizon Industrial Parks"
 
@@ -241,7 +240,6 @@ def notify_internal_submission_received(submission: "VendorOnboardingSubmission"
         vendor_name = submission.normalized_vendor_name or invitation.vendor_name_hint or "Unknown"
         vendor_email = submission.normalized_email or invitation.vendor_email
 
-        # Log for now — acts as structured audit trail
         inviter_info = (
             f"{inviter.get_full_name()} ({inviter.email})"
             if inviter else "system"
@@ -253,8 +251,26 @@ def notify_internal_submission_received(submission: "VendorOnboardingSubmission"
             inviter_info, submission.status,
         )
 
-        # TODO: wire to in-app notification system when available
-        # e.g., Notification.objects.create(recipient=inviter, ...)
+        if inviter and getattr(inviter, "email", None):
+            inviter_name = inviter.get_full_name().strip() or inviter.email
+            subject = f"[Horizon] Vendor Documents Submitted — Under Finance Review ({vendor_name})"
+            body = (
+                f"Dear {inviter_name},\n\n"
+                f"The vendor you invited, {vendor_name} ({vendor_email}), has submitted their onboarding details and compliance documents.\n\n"
+                f"Status: Under Finance Review\n"
+                f"Submission ID: #{submission.pk}\n\n"
+                f"The submission has been routed directly to the Finance team for document verification and SAP Vendor ID creation.\n"
+                f"You can view the submitted documents and track the status in the FundFlow portal under Vendors > Submissions.\n\n"
+                f"Regards,\n"
+                f"Horizon Industrial Parks\n"
+            )
+            email = EmailMessage(
+                subject=subject,
+                body=body,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                to=[inviter.email],
+            )
+            email.send(fail_silently=True)
 
     except Exception as exc:
         _logger.warning(
@@ -386,9 +402,6 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
         vendor:      Vendor instance
     """
     try:
-        from django.conf import settings
-        from django.core.mail import EmailMessage
-
         invitation = submission.invitation
         vendor_email = submission.normalized_email or invitation.vendor_email
         vendor_name = submission.normalized_vendor_name or "your registration"
@@ -445,7 +458,7 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
 
             <p style="margin:0 0 20px;font-size:14px;color:#374151;line-height:1.7;">
               <strong>Next Steps:</strong><br>
-              The next step is marketing review. You will be notified once that process is complete.
+              Your vendor onboarding is complete and your profile is now active. You will receive portal login details to submit invoices and track bills.
             </p>
 
             <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">
@@ -481,17 +494,20 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
         _logger.info("Vendor approval email sent for submission_id=%s to %s", submission.pk, vendor_email)
 
         # ── Internal inviter notification ─────────────────────────────────
-        if inviter and inviter.email:
+        if inviter and getattr(inviter, "email", None):
             try:
-                inviter_subject = f"[Horizon] Vendor Registration Approved — {vendor_name}"
+                inviter_name = inviter.get_full_name().strip() or inviter.email
+                inviter_subject = f"[Horizon] Vendor Onboarding Approved by Finance — {vendor_name}"
                 inviter_body = (
-                    f"A vendor registration has been approved by finance.\n\n"
-                    f"Vendor  : {vendor_name}\n"
-                    f"Email   : {vendor_email}\n"
-                    f"SAP ID  : {vendor.sap_vendor_id or 'Pending'}\n"
-                    f"Submission: #{submission.pk}\n\n"
-                    f"The submission has moved to marketing review. "
-                    f"Marketing team will take further action.\n"
+                    f"Dear {inviter_name},\n\n"
+                    f"The vendor onboarding registration for {vendor_name} has been reviewed and APPROVED by Finance.\n\n"
+                    f"Vendor       : {vendor_name}\n"
+                    f"Email        : {vendor_email}\n"
+                    f"SAP Vendor ID: {vendor.sap_vendor_id or 'Assigned'}\n"
+                    f"Submission   : #{submission.pk}\n\n"
+                    f"The vendor profile is now active and ready for purchase orders and invoice processing.\n\n"
+                    f"Regards,\n"
+                    f"Horizon Industrial Parks\n"
                 )
                 inviter_email = EmailMessage(
                     subject=inviter_subject,
@@ -499,7 +515,7 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
                     from_email=settings.DEFAULT_FROM_EMAIL,
                     to=[inviter.email],
                 )
-                inviter_email.send(fail_silently=False)
+                inviter_email.send(fail_silently=True)
                 _logger.info(
                     "Internal approval notification sent for submission_id=%s to inviter %s",
                     submission.pk, inviter.email,
@@ -509,9 +525,6 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
                     "Failed to send internal approval notification for submission_id=%s to %s: %s",
                     submission.pk, inviter.email, exc,
                 )
-
-        # ── Marketing team notification ───────────────────────────────────
-        _notify_marketing_action_required(submission, vendor)
 
     except Exception as exc:
         _logger.error(

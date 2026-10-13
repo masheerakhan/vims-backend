@@ -193,11 +193,12 @@ class VendorAttachmentSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
     def get_file_url(self, obj):
+        request = self.context.get("request")
         if obj.file:
-            request = self.context.get("request")
+            download_path = f"/api/v1/vendors/attachments/{obj.id}/download/"
             if request:
-                return request.build_absolute_uri(obj.file.url)
-            return obj.file.url
+                return request.build_absolute_uri(download_path)
+            return download_path
         return obj.file_url or ""
 
 

@@ -7,6 +7,8 @@ from .models import (
     BudgetRule,
     BudgetConsumption,
     BudgetVarianceRequest,
+    BudgetBlockSetting,
+    BudgetBlock,
 )
 
 
@@ -73,3 +75,19 @@ class BudgetVarianceRequestAdmin(admin.ModelAdmin):
         "requested_by", "reviewed_by", "created_at",
     )
     list_filter = ("status", "source_type")
+
+
+@admin.register(BudgetBlockSetting)
+class BudgetBlockSettingAdmin(admin.ModelAdmin):
+    list_display = ("id", "org", "default_block_period_days", "max_extension_days", "updated_at")
+
+
+@admin.register(BudgetBlock)
+class BudgetBlockAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "budget_line", "blocked_by", "blocked_amount",
+        "status", "blocked_at", "expires_at", "extension_status",
+    )
+    list_filter = ("status", "extension_status")
+    search_fields = ("blocked_by__email", "blocked_by__first_name", "blocked_by__last_name")
+

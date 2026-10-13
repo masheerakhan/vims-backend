@@ -16,7 +16,10 @@ from pathlib import PurePosixPath
 from typing import Iterator
 from uuid import uuid4
 
-import paramiko
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
 
 from apps.document_ingestion.connectors.base import ConnectorError, RemoteDocument
 

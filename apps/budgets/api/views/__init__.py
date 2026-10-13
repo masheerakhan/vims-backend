@@ -24,6 +24,10 @@ from apps.budgets.models import (
     ImportMode,
     BudgetRevisionSource,
     BudgetRevisionStatus,
+    BudgetBlock,
+    BudgetBlockSetting,
+    BudgetBlockStatus,
+    BudgetExtensionStatus,
 )
 from apps.budgets.api.serializers import (
     BudgetCategorySerializer,
@@ -50,6 +54,12 @@ from apps.budgets.api.serializers import (
     BudgetRevisionSerializer,
     BudgetRevisionManualCreateSerializer,
     BudgetRevisionExcelCreateSerializer,
+    BudgetBlockSerializer,
+    BudgetBlockSettingSerializer,
+    CreateBudgetBlockSerializer,
+    ReleaseBudgetBlockSerializer,
+    RequestBudgetBlockExtensionSerializer,
+    ReviewBudgetBlockExtensionSerializer,
 )
 from apps.budgets.services import (
     reserve_budget_line,
@@ -57,6 +67,12 @@ from apps.budgets.services import (
     release_reserved_budget_line,
     review_variance_request,
     resolve_budget_line_for_allocation,
+    create_budget_block,
+    release_budget_block,
+    request_budget_block_extension,
+    review_budget_block_extension,
+    get_budget_block_setting,
+    BudgetBlockedError,
     BudgetLineNotFoundError,
     BudgetLimitExceeded,
     BudgetNotActiveError,
@@ -1161,3 +1177,191 @@ class BudgetOverviewView(APIView):
     def get(self, request):
         payload = get_budgets_overview(request.user)
         return Response(payload)
+
+
+# ---------------------------------------------------------------------------
+# Budget Blocking (Locking) ViewSet & Settings View
+# ---------------------------------------------------------------------------
+
+class BudgetBlockViewSet(ModelViewSet):
+    """
+    CRUD and actions for marketing budget blocks (locks).
+    """
+    serializer_class = BudgetBlockSerializer
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_queryset(self):
+        from django.utils import timezone
+        user = self.request.user
+        now = timezone.now()
+
+        # Run auto-expiry check on any active blocks whose expires_at passed
+        BudgetBlock.objects.filter(status=BudgetBlockStatus.ACTIVE, expires_at__lte=now).update(
+            status=BudgetBlockStatus.EXPIRED,
+            updated_at=now,
+        )
+
+        qs = BudgetBlock.objects.all().select_related(
+            "budget_line",
+            "budget_line__budget",
+            "budget_line__budget__scope_node",
+            "budget_line__category",
+            "budget_line__subcategory",
+            "blocked_by",
+            "released_by",
+            "extension_reviewed_by",
+        )
+
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+
+        extension_status_param = self.request.query_params.get("extension_status")
+        if extension_status_param:
+            qs = qs.filter(extension_status=extension_status_param)
+
+        my_blocks = self.request.query_params.get("my_blocks")
+        if my_blocks and my_blocks.lower() in ("true", "1", "yes"):
+            qs = qs.filter(blocked_by=user)
+
+        budget_id = self.request.query_params.get("budget")
+        if budget_id:
+            qs = qs.filter(budget_line__budget_id=budget_id)
+
+        scope_node_id = self.request.query_params.get("scope_node")
+        if scope_node_id:
+            qs = qs.filter(budget_line__budget__scope_node_id=scope_node_id)
+
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        serializer = CreateBudgetBlockSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            block = create_budget_block(
+                budget_line=data["budget_line"],
+                blocked_by=request.user,
+                blocked_amount=data["blocked_amount"],
+                custom_days=data.get("custom_days"),
+            )
+        except (BudgetBlockedError, BudgetLimitExceeded, BudgetNotActiveError, ValueError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(BudgetBlockSerializer(block, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="release")
+    def release(self, request, pk=None):
+        block = self.get_object()
+        serializer = ReleaseBudgetBlockSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        note = serializer.validated_data.get("note", "")
+
+        try:
+            block = release_budget_block(block=block, user=request.user, note=note)
+        except (PermissionError, ValueError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(BudgetBlockSerializer(block, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"], url_path="request-extension")
+    def request_extension(self, request, pk=None):
+        block = self.get_object()
+        serializer = RequestBudgetBlockExtensionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            block = request_budget_block_extension(
+                block=block,
+                user=request.user,
+                days_requested=data["days_requested"],
+                reason=data["reason"],
+            )
+        except (PermissionError, ValueError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(BudgetBlockSerializer(block, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"], url_path="review-extension")
+    def review_extension(self, request, pk=None):
+        user = request.user
+        is_admin = getattr(user, "is_staff", False) or getattr(user, "role", "") in ("admin", "superadmin", "tenant_admin")
+        if not is_admin:
+            return Response({"detail": "Only administrators can review extension requests."}, status=status.HTTP_403_FORBIDDEN)
+
+        block = self.get_object()
+        serializer = ReviewBudgetBlockExtensionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        try:
+            block = review_budget_block_extension(
+                block=block,
+                reviewer=request.user,
+                decision=data["decision"],
+                admin_notes=data.get("admin_notes", ""),
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(BudgetBlockSerializer(block, context={"request": request}).data)
+
+
+class BudgetBlockSettingView(APIView):
+    """
+    GET /api/v1/budgets/block-settings/
+    PATCH /api/v1/budgets/block-settings/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _get_org(self, request):
+        from apps.core.models import Organization
+        org_id = request.query_params.get("org")
+        if org_id:
+            return Organization.objects.filter(id=org_id).first() or Organization.objects.first()
+        return getattr(request.user, "organization", None) or Organization.objects.first()
+
+    def get(self, request):
+        org = self._get_org(request)
+        if not org:
+            return Response({"detail": "Organization not found."}, status=status.HTTP_404_NOT_FOUND)
+        setting = get_budget_block_setting(org)
+        return Response(BudgetBlockSettingSerializer(setting).data)
+
+    def patch(self, request):
+        user = request.user
+        is_admin = getattr(user, "is_staff", False) or getattr(user, "role", "") in ("admin", "superadmin", "tenant_admin")
+        if not is_admin:
+            return Response({"detail": "Only administrators can modify budget block settings."}, status=status.HTTP_403_FORBIDDEN)
+
+        org = self._get_org(request)
+        if not org:
+            return Response({"detail": "Organization not found."}, status=status.HTTP_404_NOT_FOUND)
+        setting = get_budget_block_setting(org)
+
+        default_days = request.data.get("default_block_period_days")
+        if default_days is not None:
+            try:
+                days_int = int(default_days)
+                if days_int <= 0:
+                    raise ValueError
+                setting.default_block_period_days = days_int
+            except (TypeError, ValueError):
+                return Response({"detail": "default_block_period_days must be a positive integer."}, status=status.HTTP_400_BAD_REQUEST)
+
+        max_ext = request.data.get("max_extension_days")
+        if max_ext is not None:
+            try:
+                max_int = int(max_ext)
+                if max_int <= 0:
+                    raise ValueError
+                setting.max_extension_days = max_int
+            except (TypeError, ValueError):
+                return Response({"detail": "max_extension_days must be a positive integer."}, status=status.HTTP_400_BAD_REQUEST)
+
+        setting.save(update_fields=["default_block_period_days", "max_extension_days", "updated_at"])
+        return Response(BudgetBlockSettingSerializer(setting).data)
+

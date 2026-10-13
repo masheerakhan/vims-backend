@@ -1,6 +1,7 @@
 import mimetypes
 import os
 
+from django.db.models import Q
 from django.http import FileResponse, Http404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -194,10 +195,17 @@ class VendorSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = VendorSubmissionSerializer
 
     def get_queryset(self):
-        visible_scope_ids = get_user_visible_scope_ids(self.request.user)
-        qs = VendorOnboardingSubmission.objects.select_related(
-            "invitation__org", "invitation__scope_node"
-        ).filter(invitation__scope_node_id__in=visible_scope_ids)
+        base_qs = VendorOnboardingSubmission.objects.select_related(
+            "invitation__org", "invitation__scope_node", "invitation__invited_by"
+        )
+        if self.request.user.is_superuser:
+            qs = base_qs
+        else:
+            visible_scope_ids = get_user_visible_scope_ids(self.request.user)
+            qs = base_qs.filter(
+                Q(invitation__scope_node_id__in=visible_scope_ids)
+                | Q(invitation__invited_by=self.request.user)
+            )
         params = self.request.query_params
         if org_id := params.get("org"):
             qs = qs.filter(invitation__org_id=org_id)
@@ -395,20 +403,43 @@ class VendorSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
 
 class VendorAttachmentViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    Internal read-only attachment listing.
+    Internal read-only attachment listing and document viewing/download.
     Filters: submission
     """
     permission_classes = [IsAuthenticated]
     serializer_class = VendorAttachmentSerializer
 
     def get_queryset(self):
-        visible_scope_ids = get_user_visible_scope_ids(self.request.user)
-        qs = VendorAttachment.objects.select_related("submission", "uploaded_by").filter(
-            submission__invitation__scope_node_id__in=visible_scope_ids
-        )
+        base_qs = VendorAttachment.objects.select_related("submission", "uploaded_by")
+        if self.request.user.is_superuser:
+            qs = base_qs
+        else:
+            visible_scope_ids = get_user_visible_scope_ids(self.request.user)
+            qs = base_qs.filter(
+                Q(submission__invitation__scope_node_id__in=visible_scope_ids)
+                | Q(submission__invitation__invited_by=self.request.user)
+            )
         if sub_id := self.request.query_params.get("submission"):
             qs = qs.filter(submission_id=sub_id)
         return qs
+
+    @action(detail=True, methods=["get"], url_path="download")
+    def download(self, request, pk=None):
+        attachment = self.get_object()
+        if not attachment.file:
+            if attachment.file_url:
+                from django.http import HttpResponseRedirect
+                return HttpResponseRedirect(attachment.file_url)
+            return Response({"detail": "File not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        content_type, _ = mimetypes.guess_type(attachment.file_name or attachment.file.name)
+        response = FileResponse(
+            attachment.file.open("rb"),
+            content_type=content_type or "application/octet-stream",
+            as_attachment=False,
+            filename=attachment.file_name or attachment.title,
+        )
+        return response
 
 
 from rest_framework.pagination import PageNumberPagination

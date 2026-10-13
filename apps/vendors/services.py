@@ -1706,6 +1706,15 @@ def approve_vendor_submission_finance(
         primary_vendor_email=activation_result["email"],
     )
 
+    try:
+        from apps.vendors.notifications import notify_vendor_approved
+        notify_vendor_approved(submission, vendor)
+    except Exception as exc:
+        _logger.warning(
+            "Failed to send vendor approval notification for submission_id=%s: %s",
+            submission.pk, exc,
+        )
+
     _build_audit_log(
         user=actor,
         action="vendor_finance_approved",

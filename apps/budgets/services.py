@@ -2,7 +2,7 @@ from django.db import transaction
 from django.db.models import Max, Sum, Q
 from django.utils import timezone
 from decimal import Decimal, InvalidOperation
-from datetime import date
+from datetime import date, timedelta
 
 from apps.budgets.models import (
     Budget,
@@ -16,6 +16,10 @@ from apps.budgets.models import (
     BudgetImportRow,
     BudgetRevision,
     BudgetRevisionLine,
+    BudgetBlock,
+    BudgetBlockSetting,
+    BudgetBlockStatus,
+    BudgetExtensionStatus,
     ConsumptionType,
     ConsumptionStatus,
     VarianceStatus,
@@ -34,6 +38,10 @@ from apps.budgets.models import (
 # ---------------------------------------------------------------------------
 # Custom exceptions
 # ---------------------------------------------------------------------------
+
+class BudgetBlockedError(ValueError):
+    """Raised when a budget line is blocked by another user."""
+
 
 class BudgetLimitExceeded(ValueError):
     """Raised when a reservation would exceed the hard block threshold."""
@@ -234,6 +242,8 @@ def reserve_budget_line(
             f"for budget line {line.id}."
         )
 
+    check_budget_line_block(line, requested_by, amount)
+
     consumption = BudgetConsumption.objects.create(
         budget=budget,
         budget_line=line,
@@ -358,6 +368,8 @@ def consume_budget_line_direct(
         raise ValueError(
             f"Budget source {source_type}/{source_id} has already been posted."
         )
+    check_budget_line_block(line, consumed_by, amount)
+
     if amount > line.available_amount:
         raise BudgetLimitExceeded(
             f"Consumption of {amount} exceeds available amount of {line.available_amount} "
@@ -1962,3 +1974,224 @@ def publish_budget_revision(*, revision: BudgetRevision, published_by) -> Budget
     revision.published_at = timezone.now()
     revision.save(update_fields=["status", "published_by", "published_at", "updated_at"])
     return revision
+
+
+# ---------------------------------------------------------------------------
+# Budget Blocking (Locking) Services
+# ---------------------------------------------------------------------------
+
+def check_budget_line_block(line: BudgetLine, actor, amount: Decimal = None) -> None:
+    """
+    Ensures that if budget_line has any active blocks, only the user who blocked it
+    can perform reservations or deductions against it.
+
+    If blocked by someone else:
+    Raises BudgetBlockedError: "[Name] has blocked this budget until [Date]. Please coordinate with them."
+    """
+    now = timezone.now()
+    active_blocks = BudgetBlock.objects.filter(budget_line=line, status=BudgetBlockStatus.ACTIVE)
+    for b in active_blocks:
+        if b.expires_at <= now:
+            b.status = BudgetBlockStatus.EXPIRED
+            b.save(update_fields=["status", "updated_at"])
+
+    # Re-fetch non-expired active blocks
+    active_blocks = BudgetBlock.objects.filter(
+        budget_line=line,
+        status=BudgetBlockStatus.ACTIVE,
+        expires_at__gt=now,
+    ).select_related("blocked_by")
+
+    if not active_blocks.exists():
+        return
+
+    actor_id = getattr(actor, "id", None) or (actor if isinstance(actor, (int, str)) else None)
+    for block in active_blocks:
+        if block.blocked_by_id != actor_id:
+            blocker = block.blocked_by
+            blocker_name = blocker.get_full_name().strip() if blocker else ""
+            if not blocker_name and blocker:
+                blocker_name = blocker.email
+            blocker_str = blocker_name or "Another user"
+            expiry_str = block.expires_at.strftime("%d %b %Y")
+            raise BudgetBlockedError(
+                f"{blocker_str} has blocked this budget until {expiry_str}. Please coordinate with them."
+            )
+
+
+def get_budget_block_setting(org) -> BudgetBlockSetting:
+    setting, _ = BudgetBlockSetting.objects.get_or_create(
+        org=org,
+        defaults={"default_block_period_days": 30, "max_extension_days": 30},
+    )
+    return setting
+
+
+@transaction.atomic
+def create_budget_block(
+    budget_line: BudgetLine,
+    blocked_by,
+    blocked_amount: Decimal,
+    custom_days: int = None,
+) -> BudgetBlock:
+    now = timezone.now()
+    budget_line.refresh_from_db()
+
+    if budget_line.budget.status != BudgetStatus.ACTIVE:
+        raise BudgetNotActiveError(f"Budget {budget_line.budget_id} is not ACTIVE.")
+
+    if blocked_amount <= 0:
+        raise ValueError("Blocked amount must be greater than zero.")
+
+    # Auto-expire any stale blocks
+    active_blocks = BudgetBlock.objects.filter(
+        budget_line=budget_line,
+        status=BudgetBlockStatus.ACTIVE,
+    )
+    for b in active_blocks:
+        if b.expires_at <= now:
+            b.status = BudgetBlockStatus.EXPIRED
+            b.save(update_fields=["status", "updated_at"])
+
+    # If blocked by someone else, prevent
+    other_blocks = BudgetBlock.objects.filter(
+        budget_line=budget_line,
+        status=BudgetBlockStatus.ACTIVE,
+        expires_at__gt=now,
+    ).exclude(blocked_by=blocked_by).select_related("blocked_by")
+
+    if other_blocks.exists():
+        first = other_blocks.first()
+        blocker = first.blocked_by
+        blocker_name = blocker.get_full_name().strip() if blocker else ""
+        if not blocker_name and blocker:
+            blocker_name = blocker.email
+        expiry_str = first.expires_at.strftime("%d %b %Y")
+        raise BudgetBlockedError(
+            f"{blocker_name or 'Another user'} has blocked this budget until {expiry_str}. Please coordinate with them."
+        )
+
+    # Check available amount
+    available = budget_line.available_amount
+    if available <= Decimal("0"):
+        raise BudgetLimitExceeded(
+            "Available budget is ₹0. Cannot block an exhausted budget line."
+        )
+
+    existing_my_blocked = BudgetBlock.objects.filter(
+        budget_line=budget_line,
+        blocked_by=blocked_by,
+        status=BudgetBlockStatus.ACTIVE,
+        expires_at__gt=now,
+    ).aggregate(total=Sum("blocked_amount"))["total"] or Decimal("0")
+
+    if (existing_my_blocked + blocked_amount) > available:
+        raise BudgetLimitExceeded(
+            f"Blocked amount {blocked_amount} exceeds available amount of {available}."
+        )
+
+    org = budget_line.budget.org
+    setting = get_budget_block_setting(org)
+    days = custom_days if (custom_days and custom_days > 0) else setting.default_block_period_days
+    expires_at = now + timedelta(days=days)
+
+    block = BudgetBlock.objects.create(
+        budget_line=budget_line,
+        blocked_by=blocked_by,
+        blocked_amount=blocked_amount,
+        status=BudgetBlockStatus.ACTIVE,
+        blocked_at=now,
+        expires_at=expires_at,
+    )
+    return block
+
+
+@transaction.atomic
+def release_budget_block(block: BudgetBlock, user, note: str = "") -> BudgetBlock:
+    user_id = getattr(user, "id", None) or user
+    is_owner = (block.blocked_by_id == user_id)
+    is_admin = getattr(user, "is_staff", False) or getattr(user, "role", "") in ("admin", "superadmin", "tenant_admin")
+    if not (is_owner or is_admin):
+        raise PermissionError("Only the blocker or an administrator can release this block.")
+
+    if block.status != BudgetBlockStatus.ACTIVE:
+        raise ValueError(f"Block is {block.status}, cannot release.")
+
+    block.status = BudgetBlockStatus.RELEASED
+    block.released_at = timezone.now()
+    block.released_by = user if hasattr(user, "id") else None
+    block.release_note = note
+    block.save(update_fields=["status", "released_at", "released_by", "release_note", "updated_at"])
+    return block
+
+
+@transaction.atomic
+def request_budget_block_extension(
+    block: BudgetBlock,
+    user,
+    days_requested: int,
+    reason: str,
+) -> BudgetBlock:
+    user_id = getattr(user, "id", None) or user
+    if block.blocked_by_id != user_id:
+        raise PermissionError("Only the user who blocked this budget can request an extension.")
+
+    if block.status != BudgetBlockStatus.ACTIVE:
+        raise ValueError("Cannot request an extension for an inactive or expired block.")
+
+    if not reason or not reason.strip():
+        raise ValueError("A reason/comment is required to request an extension.")
+
+    if days_requested <= 0:
+        raise ValueError("Days requested must be greater than zero.")
+
+    block.extension_status = BudgetExtensionStatus.PENDING
+    block.extension_days_requested = days_requested
+    block.extension_reason = reason.strip()
+    block.extension_requested_at = timezone.now()
+    block.save(update_fields=[
+        "extension_status",
+        "extension_days_requested",
+        "extension_reason",
+        "extension_requested_at",
+        "updated_at",
+    ])
+    return block
+
+
+@transaction.atomic
+def review_budget_block_extension(
+    block: BudgetBlock,
+    reviewer,
+    decision: str,
+    admin_notes: str = "",
+) -> BudgetBlock:
+    if block.extension_status != BudgetExtensionStatus.PENDING:
+        raise ValueError("This block does not have a pending extension request.")
+
+    decision_norm = decision.strip().lower()
+    now = timezone.now()
+
+    if decision_norm == "approve":
+        days = block.extension_days_requested or 30
+        base_date = max(block.expires_at, now)
+        block.expires_at = base_date + timedelta(days=days)
+        block.extension_status = BudgetExtensionStatus.APPROVED
+    elif decision_norm == "reject":
+        block.extension_status = BudgetExtensionStatus.REJECTED
+    else:
+        raise ValueError(f"Invalid decision '{decision}'. Expected 'approve' or 'reject'.")
+
+    block.extension_reviewed_by = reviewer if hasattr(reviewer, "id") else None
+    block.extension_reviewed_at = now
+    block.extension_admin_notes = admin_notes.strip()
+    block.save(update_fields=[
+        "expires_at",
+        "extension_status",
+        "extension_reviewed_by",
+        "extension_reviewed_at",
+        "extension_admin_notes",
+        "updated_at",
+    ])
+    return block
+

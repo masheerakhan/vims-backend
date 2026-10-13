@@ -25,6 +25,10 @@ from apps.budgets.models import (
     BudgetRevisionSource,
     BudgetRevisionStatus,
     BudgetRevisionLineChangeType,
+    BudgetBlock,
+    BudgetBlockSetting,
+    BudgetBlockStatus,
+    BudgetExtensionStatus,
 )
 
 
@@ -845,3 +849,114 @@ class BudgetRevisionExcelCreateSerializer(serializers.Serializer):
         if not name.endswith((".xlsx", ".xls")):
             raise serializers.ValidationError("Upload an .xlsx or .xls budget allocation workbook.")
         return value
+
+
+# ---------------------------------------------------------------------------
+# BudgetBlock Serializers
+# ---------------------------------------------------------------------------
+
+class BudgetBlockSettingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BudgetBlockSetting
+        fields = ("id", "org", "default_block_period_days", "max_extension_days", "created_at", "updated_at")
+        read_only_fields = ("id", "org", "created_at", "updated_at")
+
+
+class BudgetBlockLineDetailSerializer(serializers.ModelSerializer):
+    budget_id = serializers.IntegerField(source="budget.id", read_only=True)
+    budget_name = serializers.CharField(source="budget.name", read_only=True)
+    budget_code = serializers.CharField(source="budget.code", read_only=True)
+    scope_node_id = serializers.IntegerField(source="budget.scope_node.id", read_only=True)
+    scope_node_name = serializers.CharField(source="budget.scope_node.name", read_only=True)
+    scope_node_type = serializers.CharField(source="budget.scope_node.node_type", read_only=True)
+    category_id = serializers.IntegerField(source="category.id", read_only=True)
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    subcategory_id = serializers.IntegerField(source="subcategory.id", read_only=True, allow_null=True)
+    subcategory_name = serializers.CharField(source="subcategory.name", read_only=True, allow_null=True)
+    available_amount = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = BudgetLine
+        fields = (
+            "id", "budget_id", "budget_name", "budget_code",
+            "scope_node_id", "scope_node_name", "scope_node_type",
+            "category_id", "category_name",
+            "subcategory_id", "subcategory_name",
+            "allocated_amount", "reserved_amount", "consumed_amount", "available_amount",
+        )
+
+
+class BudgetBlockSerializer(serializers.ModelSerializer):
+    budget_line_detail = BudgetBlockLineDetailSerializer(source="budget_line", read_only=True)
+    blocked_by_name = serializers.SerializerMethodField()
+    blocked_by_email = serializers.EmailField(source="blocked_by.email", read_only=True)
+    released_by_name = serializers.SerializerMethodField()
+    extension_reviewed_by_name = serializers.SerializerMethodField()
+    days_remaining = serializers.SerializerMethodField()
+    is_active = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BudgetBlock
+        fields = (
+            "id", "budget_line", "budget_line_detail",
+            "blocked_by", "blocked_by_name", "blocked_by_email",
+            "blocked_amount", "status", "blocked_at", "expires_at",
+            "days_remaining", "is_active",
+            "released_at", "released_by", "released_by_name", "release_note",
+            "consumed_at", "consumed_by_invoice_id",
+            "extension_status", "extension_days_requested", "extension_reason", "extension_requested_at",
+            "extension_reviewed_by", "extension_reviewed_by_name", "extension_reviewed_at", "extension_admin_notes",
+            "created_at", "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_blocked_by_name(self, obj) -> str:
+        if not obj.blocked_by:
+            return ""
+        name = obj.blocked_by.get_full_name().strip()
+        return name if name else obj.blocked_by.email
+
+    def get_released_by_name(self, obj) -> str:
+        if not obj.released_by:
+            return ""
+        name = obj.released_by.get_full_name().strip()
+        return name if name else obj.released_by.email
+
+    def get_extension_reviewed_by_name(self, obj) -> str:
+        if not obj.extension_reviewed_by:
+            return ""
+        name = obj.extension_reviewed_by.get_full_name().strip()
+        return name if name else obj.extension_reviewed_by.email
+
+    def get_days_remaining(self, obj) -> int:
+        from django.utils import timezone
+        now = timezone.now()
+        if obj.expires_at <= now or obj.status != BudgetBlockStatus.ACTIVE:
+            return 0
+        diff = obj.expires_at - now
+        return max(0, diff.days + (1 if diff.seconds > 0 else 0))
+
+    def get_is_active(self, obj) -> bool:
+        from django.utils import timezone
+        return obj.status == BudgetBlockStatus.ACTIVE and timezone.now() < obj.expires_at
+
+
+class CreateBudgetBlockSerializer(serializers.Serializer):
+    budget_line = serializers.PrimaryKeyRelatedField(queryset=BudgetLine.objects.all())
+    blocked_amount = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0.01"))
+    custom_days = serializers.IntegerField(required=False, min_value=1, allow_null=True)
+
+
+class ReleaseBudgetBlockSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class RequestBudgetBlockExtensionSerializer(serializers.Serializer):
+    days_requested = serializers.IntegerField(min_value=1)
+    reason = serializers.CharField(required=True, allow_blank=False)
+
+
+class ReviewBudgetBlockExtensionSerializer(serializers.Serializer):
+    decision = serializers.ChoiceField(choices=["approve", "reject"])
+    admin_notes = serializers.CharField(required=False, allow_blank=True, default="")
+

@@ -1,4 +1,5 @@
 import secrets
+from datetime import timedelta
 from pathlib import Path
 
 from django.conf import settings
@@ -308,6 +309,10 @@ class VendorAttachment(models.Model):
         return f"VendorAttachment {self.id}: {self.title}"
 
 
+def _default_finance_token_expiry():
+    return timezone.now() + timedelta(hours=72)
+
+
 class VendorFinanceActionToken(models.Model):
     submission = models.ForeignKey(
         VendorOnboardingSubmission,
@@ -316,7 +321,7 @@ class VendorFinanceActionToken(models.Model):
     )
     action_type = models.CharField(max_length=10, choices=FinanceActionType.choices)
     token = models.CharField(max_length=64, unique=True)
-    expires_at = models.DateTimeField()
+    expires_at = models.DateTimeField(default=_default_finance_token_expiry)
     used_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 

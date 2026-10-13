@@ -654,6 +654,14 @@ def validate_invoice_import_batch(batch: InvoiceImportBatch) -> InvoiceImportBat
         row.resolved_subcategory = resolved_subcat
         row.resolved_budget_line = resolved_line
 
+        # Check if the budget line is currently blocked by another user
+        if resolved_line and not errors:
+            from apps.budgets.services import check_budget_line_block, BudgetBlockedError
+            try:
+                check_budget_line_block(resolved_line, getattr(batch, "uploaded_by", None), row.amount)
+            except BudgetBlockedError as exc:
+                errors.append(str(exc))
+
         # 4. Duplicate invoice check (Idempotent import protection)
         inv_num_norm = _normalize_text(row.invoice_number)
         v_name_norm = _normalize_text(row.vendor_name)

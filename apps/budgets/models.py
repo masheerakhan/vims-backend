@@ -2,11 +2,26 @@ from django.conf import settings
 from django.db import models
 from django.core.validators import MinValueValidator
 from decimal import Decimal
+from django.utils import timezone
 
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
+
+class BudgetBlockStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    CONSUMED = "consumed", "Consumed"
+    RELEASED = "released", "Released"
+    EXPIRED = "expired", "Expired"
+
+
+class BudgetExtensionStatus(models.TextChoices):
+    NONE = "none", "None"
+    PENDING = "pending", "Pending"
+    APPROVED = "approved", "Approved"
+    REJECTED = "rejected", "Rejected"
+
 
 class PeriodType(models.TextChoices):
     YEARLY = "yearly", "Yearly"
@@ -835,3 +850,122 @@ class BudgetImportRow(models.Model):
 
     def __str__(self):
         return f"ImportRow {self.id} (batch={self.batch_id}, row={self.row_number}, {self.status})"
+
+
+# ---------------------------------------------------------------------------
+# BudgetBlockSetting
+# ---------------------------------------------------------------------------
+
+class BudgetBlockSetting(models.Model):
+    """
+    Organization-level settings for the budget blocking system.
+    Configured dynamically by Admin.
+    """
+    org = models.OneToOneField(
+        "core.Organization",
+        on_delete=models.CASCADE,
+        related_name="budget_block_setting",
+    )
+    default_block_period_days = models.PositiveIntegerField(
+        default=30,
+        help_text="Default duration (in days) that a budget block remains active.",
+    )
+    max_extension_days = models.PositiveIntegerField(
+        default=30,
+        help_text="Maximum days an extension can be requested for.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "budget_block_settings"
+
+    def __str__(self):
+        return f"BudgetBlockSetting (org={self.org_id}, period={self.default_block_period_days}d)"
+
+
+# ---------------------------------------------------------------------------
+# BudgetBlock
+# ---------------------------------------------------------------------------
+
+class BudgetBlock(models.Model):
+    """
+    Represents an exclusive lock/reservation placed on a budget line by a marketing user.
+    Prevents deductions by other users until released, expired, or consumed.
+    """
+    budget_line = models.ForeignKey(
+        "budgets.BudgetLine",
+        on_delete=models.CASCADE,
+        related_name="blocks",
+    )
+    blocked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="budget_blocks",
+    )
+    blocked_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        validators=[MinValueValidator(Decimal("0.01"))],
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=BudgetBlockStatus.choices,
+        default=BudgetBlockStatus.ACTIVE,
+    )
+    blocked_at = models.DateTimeField(default=timezone.now)
+    expires_at = models.DateTimeField()
+    released_at = models.DateTimeField(null=True, blank=True)
+    released_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="released_budget_blocks",
+    )
+    release_note = models.TextField(blank=True)
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    consumed_by_invoice_id = models.CharField(max_length=100, blank=True)
+
+    # Extension request fields
+    extension_status = models.CharField(
+        max_length=20,
+        choices=BudgetExtensionStatus.choices,
+        default=BudgetExtensionStatus.NONE,
+    )
+    extension_days_requested = models.PositiveIntegerField(null=True, blank=True)
+    extension_reason = models.TextField(blank=True)
+    extension_requested_at = models.DateTimeField(null=True, blank=True)
+    extension_reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reviewed_budget_block_extensions",
+    )
+    extension_reviewed_at = models.DateTimeField(null=True, blank=True)
+    extension_admin_notes = models.TextField(blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "budget_blocks"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["budget_line", "status"]),
+            models.Index(fields=["blocked_by", "status"]),
+            models.Index(fields=["status", "expires_at"]),
+        ]
+
+    def __str__(self):
+        return f"BudgetBlock {self.id}: line={self.budget_line_id} by user={self.blocked_by_id} [{self.status}]"
+
+    def check_auto_expiry(self) -> bool:
+        """If active and current time has passed expires_at, mark expired."""
+        if self.status == BudgetBlockStatus.ACTIVE and timezone.now() >= self.expires_at:
+            self.status = BudgetBlockStatus.EXPIRED
+            self.save(update_fields=["status", "updated_at"])
+            return True
+        return False
+

@@ -515,7 +515,9 @@ def _validate_historical_invoice_data(data: dict, actor) -> list[dict]:
                     category_id=category.id,
                     subcategory_id=subcategory.id if subcategory else None,
                 )
-            except BudgetLineNotFoundError as exc:
+                from apps.budgets.services import check_budget_line_block, BudgetBlockedError
+                check_budget_line_block(budget_line, actor, allocation.get("amount"))
+            except (BudgetLineNotFoundError, BudgetBlockedError) as exc:
                 current_errors.append(str(exc))
 
         path = (
