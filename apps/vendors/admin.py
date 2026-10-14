@@ -3,7 +3,7 @@ from django.contrib import admin
 from .models import (
     Vendor, VendorInvitation, VendorOnboardingSubmission,
     VendorAttachment, VendorFinanceActionToken, VendorFinanceDecision,
-    VendorTrainingVideo,
+    VendorTrainingVideo, VendorImportBatch, VendorImportRow,
 )
 
 
@@ -73,3 +73,61 @@ class VendorTrainingVideoAdmin(admin.ModelAdmin):
         if not obj.created_by_id:
             obj.created_by = request.user
         super().save_model(request, obj, form, change)
+
+
+class VendorImportRowInline(admin.TabularInline):
+    model = VendorImportRow
+    extra = 0
+    can_delete = False
+    readonly_fields = ("row_number", "sap_vendor_id", "vendor_name", "scope_node_code", "email", "status")
+    fields = ("row_number", "sap_vendor_id", "vendor_name", "scope_node_code", "email", "status")
+    show_change_link = True
+
+
+@admin.register(VendorImportBatch)
+class VendorImportBatchAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "file_name",
+        "org",
+        "status",
+        "total_rows",
+        "valid_rows",
+        "error_rows",
+        "created_vendors_count",
+        "updated_vendors_count",
+        "uploaded_by",
+        "created_at",
+    )
+    list_filter = ("status", "org", "created_at")
+    search_fields = ("file_name", "id")
+    raw_id_fields = ("org", "uploaded_by")
+    readonly_fields = (
+        "created_at",
+        "updated_at",
+        "total_rows",
+        "valid_rows",
+        "error_rows",
+        "created_vendors_count",
+        "updated_vendors_count",
+        "error_summary",
+    )
+    inlines = [VendorImportRowInline]
+
+
+@admin.register(VendorImportRow)
+class VendorImportRowAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "batch",
+        "row_number",
+        "sap_vendor_id",
+        "vendor_name",
+        "scope_node_code",
+        "email",
+        "status",
+    )
+    list_filter = ("status", "batch__status")
+    search_fields = ("sap_vendor_id", "vendor_name", "email", "batch__file_name")
+    raw_id_fields = ("batch",)
+    readonly_fields = ("raw_data",)
