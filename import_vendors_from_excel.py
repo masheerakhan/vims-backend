@@ -7,8 +7,8 @@ Usage:
 Features:
     - Reads Excel sheet (.xlsx) using openpyxl.
     - Flexible column matching (case-insensitive, trims spaces).
-    - Vendors WITH code: marked as APPROVED & ACTIVE (operational_status='active', marketing_status='approved').
-    - Vendors WITHOUT code: assigned provisional 'SAP-AUTO-...' ID and marked as PENDING & INACTIVE.
+    - Vendors WITH code: marked as ACTIVE & APPROVED (operational_status='active', marketing_status='approved').
+    - Vendors WITHOUT code: assigned provisional 'SAP-AUTO-...' ID and marked as ACTIVE & PENDING (operational_status='active', marketing_status='pending').
     - Resolves ScopeNode (Park/Department) if column provided, with graceful fallback.
     - Supports --dry-run to preview what will be created/updated before saving.
 """
@@ -210,15 +210,15 @@ def import_vendors(file_path: str, dry_run: bool = False):
                 op_status = OperationalStatus.ACTIVE
                 mkt_status = MarketingStatus.APPROVED
                 appr_date = now
-                type_label = "APPROVED (Has Code)"
+                type_label = "ACTIVE & APPROVED (Has Code)"
             else:
-                # ── Vendors WITHOUT Code -> Pending & Inactive ──────────────
+                # ── Vendors WITHOUT Code -> Active & Pending ────────────────
                 clean_slug = slugify(v_name)[:15].upper() or "VENDOR"
                 final_sap_id = f"SAP-AUTO-{clean_slug}-{uuid4().hex[:6].upper()}"
-                op_status = OperationalStatus.INACTIVE
+                op_status = OperationalStatus.ACTIVE
                 mkt_status = MarketingStatus.PENDING
                 appr_date = None
-                type_label = "PENDING (No Code, Generated ID)"
+                type_label = "ACTIVE & PENDING (No Code, Generated ID)"
 
             # Check if vendor already exists by SAP ID or exact name
             existing = None
@@ -247,6 +247,9 @@ def import_vendors(file_path: str, dry_run: bool = False):
                             existing.onboarding_submission.finance_vendor_code = final_sap_id
                             existing.onboarding_submission.status = "activated"
                             existing.onboarding_submission.save(update_fields=["finance_vendor_code", "status"])
+                    else:
+                        existing.operational_status = OperationalStatus.ACTIVE
+                        existing.marketing_status = MarketingStatus.PENDING
                     if v_email:
                         existing.email = v_email
                     if v_phone:
