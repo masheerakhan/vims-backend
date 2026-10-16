@@ -35,13 +35,14 @@ from apps.vendors.models import Vendor, OperationalStatus, MarketingStatus
 
 # Flexible header aliases (lowercase, stripped)
 HEADER_ALIASES = {
+    "sap_vendor_id": [
+        "vendor code", "vendor_code", "sap vendor id", "sap_vendor_id",
+        "vendor id", "vendor_id", "sap code", "sap_code", "sap id", "sap_id",
+        "sap", "sap no", "sap number", "code",
+    ],
     "vendor_name": [
         "vendor name", "vendor_name", "vendor", "name", "company name",
         "company", "vendor / supplier name", "supplier name", "party name",
-    ],
-    "sap_vendor_id": [
-        "sap vendor id", "sap_vendor_id", "vendor code", "vendor_code",
-        "code", "sap code", "sap id", "vendor id", "sap", "sap no",
     ],
     "email": [
         "email", "vendor email", "vendor_email", "email address", "email id",
@@ -68,20 +69,37 @@ HEADER_ALIASES = {
 }
 
 
+def clean_cell_value(val) -> str:
+    """Format cell value cleanly, stripping .0 from integer floats."""
+    if val is None:
+        return ""
+    if isinstance(val, float):
+        if val.is_integer():
+            return str(int(val)).strip()
+        return str(val).strip()
+    if isinstance(val, int):
+        return str(val).strip()
+    return str(val).strip()
+
+
 def normalize_header(header_val: str) -> str:
     """Normalize raw header string to standard internal key."""
     if not header_val:
         return ""
     clean = str(header_val).strip().lower()
     clean = clean.replace("*", "").strip()
-    
+
+    # Pass 1: EXACT MATCH FIRST across all aliases (prevents prefix collision like 'vendor code' matching 'vendor')
     for standard_key, aliases in HEADER_ALIASES.items():
         if clean in aliases:
             return standard_key
-        # Check partial match for common cases
-        for alias in aliases:
+
+    # Pass 2: Prefix match sorted by longest alias first
+    for standard_key, aliases in sorted(HEADER_ALIASES.items(), key=lambda item: max(len(a) for a in item[1]), reverse=True):
+        for alias in sorted(aliases, key=len, reverse=True):
             if clean == alias or clean.startswith(alias + " "):
                 return standard_key
+
     return clean
 
 
@@ -125,12 +143,12 @@ def import_vendors(file_path: str, dry_run: bool = False):
     header_row_idx = 1
     for r in range(1, min(10, sheet.max_row + 1)):
         row_vals = [sheet.cell(row=r, column=c).value for c in range(1, sheet.max_column + 1)]
-        mapped = [normalize_header(v) for v in row_vals if v is not None]
+        mapped = [normalize_header(clean_cell_value(v)) for v in row_vals if v is not None]
         if "vendor_name" in mapped or "sap_vendor_id" in mapped:
             header_row_idx = r
             for col_idx, raw_val in enumerate(row_vals, 1):
                 if raw_val is not None:
-                    norm = normalize_header(raw_val)
+                    norm = normalize_header(clean_cell_value(raw_val))
                     if norm:
                         header_col_map[col_idx] = norm
             break
@@ -166,7 +184,7 @@ def import_vendors(file_path: str, dry_run: bool = False):
             for col_idx, field_key in header_col_map.items():
                 val = sheet.cell(row=row_idx, column=col_idx).value
                 if val is not None:
-                    row_data[field_key] = str(val).strip()
+                    row_data[field_key] = clean_cell_value(val)
 
             v_name = row_data.get("vendor_name", "").strip()
             if not v_name:
@@ -207,11 +225,17 @@ def import_vendors(file_path: str, dry_run: bool = False):
             if has_code:
                 existing = Vendor.objects.filter(sap_vendor_id__iexact=final_sap_id).first()
             if not existing and v_name:
-                existing = Vendor.objects.filter(vendor_name__iexact=v_name).first()
+                v_name_clean = " ".join(v_name.split())
+                existing = (
+                    Vendor.objects.filter(vendor_name__iexact=v_name).first()
+                    or Vendor.objects.filter(vendor_name__iexact=v_name_clean).first()
+                )
 
             if existing:
                 action = "UPDATE"
                 updated_count += 1
+                if not has_code:
+                    final_sap_id = existing.sap_vendor_id
                 if not dry_run:
                     existing.vendor_name = v_name
                     if has_code:
@@ -219,6 +243,10 @@ def import_vendors(file_path: str, dry_run: bool = False):
                         existing.operational_status = OperationalStatus.ACTIVE
                         existing.marketing_status = MarketingStatus.APPROVED
                         existing.approved_at = now
+                        if existing.onboarding_submission:
+                            existing.onboarding_submission.finance_vendor_code = final_sap_id
+                            existing.onboarding_submission.status = "activated"
+                            existing.onboarding_submission.save(update_fields=["finance_vendor_code", "status"])
                     if v_email:
                         existing.email = v_email
                     if v_phone:
