@@ -378,6 +378,54 @@ class InvoiceViewSet(ModelViewSet):
         invoice.refresh_from_db()
         return Response(InvoiceSerializer(invoice).data)
 
+    @action(detail=True, methods=["post"], url_path="upload-document")
+    def upload_document(self, request, pk=None):
+        """Upload and attach an invoice document (PDF/image) directly to this invoice."""
+        from apps.invoices.models import InvoiceDocument, InvoiceDocumentType
+        invoice = self.get_object()
+        file = request.FILES.get("file")
+        if not file:
+            return Response(
+                {"detail": "No file provided. Send 'file' as multipart/form-data."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        filename = file.name
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        doc_type = (
+            InvoiceDocumentType.INVOICE_PDF
+            if ext == "pdf"
+            else (
+                InvoiceDocumentType.INVOICE_EXCEL
+                if ext in ["xlsx", "xls"]
+                else InvoiceDocumentType.SUPPORTING_DOCUMENT
+            )
+        )
+        existing_doc = invoice.documents.filter(file_name=filename).first()
+        if existing_doc:
+            existing_doc.file = file
+            existing_doc.file_type = ext
+            existing_doc.document_type = doc_type
+            existing_doc.uploaded_by = request.user
+            existing_doc.save()
+            doc = existing_doc
+        else:
+            doc = InvoiceDocument.objects.create(
+                invoice=invoice,
+                file=file,
+                file_name=filename,
+                file_type=ext,
+                document_type=doc_type,
+                uploaded_by=request.user,
+            )
+
+        return Response({
+            "id": doc.id,
+            "file_name": doc.file_name,
+            "document_type": doc.document_type,
+            "download_url": request.build_absolute_uri(doc.file.url) if doc.file else "",
+        }, status=status.HTTP_201_CREATED)
+
     @action(detail=True, methods=["get"], url_path="payment")
     def get_payment(self, request, pk=None):
         """
@@ -1497,8 +1545,75 @@ class InvoiceImportBatchViewSet(ModelViewSet):
     @action(detail=True, methods=["post"], url_path="rerun")
     def rerun(self, request, pk=None):
         """Re-validate and commit any remaining unposted or previously errored rows in this batch."""
-        from apps.invoices.import_services import rerun_invoice_import_batch
+        from apps.invoices.import_services import rerun_invoice_import_batch, attach_bulk_invoice_documents
         batch = self.get_object()
         batch = rerun_invoice_import_batch(batch, user=request.user)
+
+    @action(detail=True, methods=["post"], url_path="upload-documents")
+    def upload_documents(self, request, pk=None):
+        """
+        Upload multiple invoice documents (PDFs, images) or a ZIP archive for invoices in this batch.
+        Files are automatically matched against batch invoices by invoice number or filename stem.
+        """
+        from apps.invoices.import_services import attach_bulk_invoice_documents
+        batch = self.get_object()
+
+        files = request.FILES.getlist("files")
+        if not files:
+            single = request.FILES.get("file")
+            if single:
+                files = [single]
+
+        if not files:
+            return Response(
+                {"detail": "No document files provided. Send 'files' as multipart/form-data."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result = attach_bulk_invoice_documents(
+            files=files,
+            batch=batch,
+            user=request.user,
+        )
+        return Response(result, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["post"], url_path="bulk-upload-documents")
+    def bulk_upload_documents(self, request):
+        """
+        Upload multiple invoice documents (PDFs, images) or a ZIP archive for ANY historical invoices.
+        Files are automatically matched by invoice number across the user's visible organization(s).
+        """
+        from apps.invoices.import_services import attach_bulk_invoice_documents
+        from apps.access.selectors import get_user_visible_org_ids
+
+        visible_org_ids = get_user_visible_org_ids(request.user)
+        target_org_id = request.data.get("org")
+        if target_org_id:
+            try:
+                org_ids = [int(target_org_id)]
+            except (ValueError, TypeError):
+                org_ids = visible_org_ids
+        else:
+            org_ids = visible_org_ids
+
+        files = request.FILES.getlist("files")
+        if not files:
+            single = request.FILES.get("file")
+            if single:
+                files = [single]
+
+        if not files:
+            return Response(
+                {"detail": "No document files provided. Send 'files' as multipart/form-data."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result = attach_bulk_invoice_documents(
+            files=files,
+            batch=None,
+            org_ids=org_ids,
+            user=request.user,
+        )
+        return Response(result, status=status.HTTP_200_OK)
         return Response(InvoiceImportBatchSerializer(batch).data)
 

@@ -36,6 +36,8 @@ from apps.invoices.models import (
     InvoiceImportRow,
     InvoiceImportBatchStatus,
     InvoiceImportRowStatus,
+    InvoiceDocument,
+    InvoiceDocumentType,
 )
 
 COLUMN_MAPPING = {
@@ -1019,4 +1021,176 @@ def rerun_invoice_import_batch(batch: InvoiceImportBatch, user=None) -> InvoiceI
     batch.save(update_fields=["activity_logs", "updated_at"])
 
     return batch
+
+
+def _clean_stem(s: str) -> str:
+    """Normalize string for fuzzy comparison by removing spaces and non-alphanumeric chars."""
+    return re.sub(r"[^a-zA-Z0-9]", "", str(s or "")).lower()
+
+
+def attach_bulk_invoice_documents(
+    files: List[Any],
+    batch: Optional[InvoiceImportBatch] = None,
+    org_ids: Optional[List[int]] = None,
+    user=None,
+) -> Dict[str, Any]:
+    """
+    Extracts individual documents from uploaded files or ZIP archives, matches them to
+    historical invoices by invoice number / filename stem, and creates InvoiceDocument records.
+    """
+    import os
+    import zipfile
+    from django.core.files.base import ContentFile
+
+    extracted_items = []
+
+    for uploaded_file in files:
+        filename = getattr(uploaded_file, "name", "file")
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+        is_zip = ext == "zip"
+        if not is_zip:
+            try:
+                uploaded_file.seek(0)
+                is_zip = zipfile.is_zipfile(uploaded_file)
+                uploaded_file.seek(0)
+            except Exception:
+                is_zip = False
+
+        if is_zip:
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+            with zipfile.ZipFile(uploaded_file) as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    inner_name = os.path.basename(info.filename)
+                    if not inner_name or inner_name.startswith(".") or inner_name.startswith("__MACOSX"):
+                        continue
+                    inner_ext = inner_name.rsplit(".", 1)[-1].lower() if "." in inner_name else ""
+                    if inner_ext not in ["pdf", "png", "jpg", "jpeg", "xlsx", "xls"]:
+                        continue
+                    file_bytes = zf.read(info)
+                    extracted_items.append((inner_name, inner_ext, ContentFile(file_bytes, name=inner_name)))
+        elif ext in ["pdf", "png", "jpg", "jpeg", "xlsx", "xls"]:
+            extracted_items.append((filename, ext, uploaded_file))
+
+    # Build invoice candidate maps
+    exact_map: Dict[str, Invoice] = {}
+    clean_map: Dict[str, Invoice] = {}
+    invoice_list: List[Invoice] = []
+
+    if batch:
+        rows = batch.rows.filter(created_invoice__isnull=False).select_related("created_invoice")
+        for row in rows:
+            inv = row.created_invoice
+            invoice_list.append(inv)
+            for raw_k in [row.invoice_number, inv.vendor_invoice_number, str(inv.id)]:
+                if raw_k:
+                    clean_k = str(raw_k).strip().lower()
+                    exact_map[clean_k] = inv
+                    clean_map[_clean_stem(clean_k)] = inv
+    else:
+        invoices = Invoice.objects.filter(
+            entry_source=InvoiceEntrySource.HISTORICAL_IMPORT,
+        )
+        if org_ids:
+            invoices = invoices.filter(scope_node__org_id__in=org_ids)
+        for inv in invoices:
+            invoice_list.append(inv)
+            for raw_k in [inv.vendor_invoice_number, str(inv.id)]:
+                if raw_k:
+                    clean_k = str(raw_k).strip().lower()
+                    exact_map[clean_k] = inv
+                    clean_map[_clean_stem(clean_k)] = inv
+
+    matched_files = []
+    unmatched_files = []
+
+    for filename, ext, file_obj in extracted_items:
+        stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+        stem_lower = stem.strip().lower()
+        stem_clean = _clean_stem(stem)
+
+        matched_invoice: Optional[Invoice] = None
+
+        # 1. Exact lowercase match
+        if stem_lower in exact_map:
+            matched_invoice = exact_map[stem_lower]
+        # 2. Clean alphanumeric match
+        elif stem_clean in clean_map:
+            matched_invoice = clean_map[stem_clean]
+        # 3. Fuzzy / substring matching: if invoice number is contained within filename stem or vice versa
+        else:
+            for clean_k, inv in clean_map.items():
+                if len(clean_k) >= 3 and (clean_k in stem_clean or (len(stem_clean) >= 3 and stem_clean in clean_k)):
+                    matched_invoice = inv
+                    break
+
+        if matched_invoice:
+            doc_type = (
+                InvoiceDocumentType.INVOICE_PDF
+                if ext == "pdf"
+                else (
+                    InvoiceDocumentType.INVOICE_EXCEL
+                    if ext in ["xlsx", "xls"]
+                    else InvoiceDocumentType.SUPPORTING_DOCUMENT
+                )
+            )
+
+            # Check if document with same name already attached
+            existing_doc = matched_invoice.documents.filter(file_name=filename).first()
+            if existing_doc:
+                existing_doc.file = file_obj
+                existing_doc.file_type = ext
+                existing_doc.document_type = doc_type
+                existing_doc.uploaded_by = user
+                existing_doc.save()
+                doc = existing_doc
+            else:
+                doc = InvoiceDocument.objects.create(
+                    invoice=matched_invoice,
+                    file=file_obj,
+                    file_name=filename,
+                    file_type=ext,
+                    document_type=doc_type,
+                    uploaded_by=user,
+                )
+
+            matched_files.append({
+                "filename": filename,
+                "invoice_id": matched_invoice.id,
+                "invoice_number": matched_invoice.vendor_invoice_number or str(matched_invoice.id),
+                "document_id": doc.id,
+                "document_url": doc.file.url if doc.file else "",
+            })
+        else:
+            unmatched_files.append({
+                "filename": filename,
+                "reason": f"No historical invoice matched for '{stem}'",
+            })
+
+    if batch and matched_files:
+        append_batch_activity_log(
+            batch,
+            event="DOCUMENTS_UPLOADED",
+            message=f"Bulk documents upload: attached {len(matched_files)} document(s) ({len(unmatched_files)} unmatched).",
+            user=user,
+            extra_details={
+                "matched_count": len(matched_files),
+                "unmatched_count": len(unmatched_files),
+            },
+        )
+        batch.save(update_fields=["activity_logs", "updated_at"])
+
+    return {
+        "total_files": len(extracted_items),
+        "matched_count": len(matched_files),
+        "unmatched_count": len(unmatched_files),
+        "matched_files": matched_files,
+        "unmatched_files": unmatched_files,
+    }
+
 

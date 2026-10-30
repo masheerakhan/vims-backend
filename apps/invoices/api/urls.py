@@ -51,6 +51,9 @@ invoice_get_payment = InvoiceViewSet.as_view({
 invoice_record_payment = InvoiceViewSet.as_view({
     "post": "record_payment",
 })
+invoice_upload_document = InvoiceViewSet.as_view({
+    "post": "upload_document",
+})
 invoice_historical_preview = InvoiceViewSet.as_view({
     "post": "historical_preview",
 })
@@ -81,4 +84,5 @@ urlpatterns = [
     path("<str:pk>/allocations/", invoice_allocations, name="invoice-allocations"),
     path("<str:pk>/payment/", invoice_get_payment, name="invoice-payment"),
     path("<str:pk>/record-payment/", invoice_record_payment, name="invoice-record-payment"),
+    path("<str:pk>/upload-document/", invoice_upload_document, name="invoice-upload-document"),
 ]

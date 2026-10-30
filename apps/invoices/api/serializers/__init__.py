@@ -36,6 +36,26 @@ class InvoiceSerializer(serializers.ModelSerializer):
     workflow_instance_id = serializers.SerializerMethodField()
     workflow_instance_status = serializers.SerializerMethodField()
     can_record_payment = serializers.SerializerMethodField()
+    document_id = serializers.SerializerMethodField()
+    document_url = serializers.SerializerMethodField()
+    document_name = serializers.SerializerMethodField()
+
+    def get_document_id(self, obj):
+        doc = obj.documents.first()
+        return doc.id if doc else None
+
+    def get_document_url(self, obj):
+        doc = obj.documents.first()
+        if doc and doc.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(doc.file.url)
+            return doc.file.url
+        return None
+
+    def get_document_name(self, obj):
+        doc = obj.documents.first()
+        return doc.file_name if doc else None
 
     class Meta:
         model = Invoice
@@ -54,6 +74,7 @@ class InvoiceSerializer(serializers.ModelSerializer):
             "workflow_selected_at",
             "workflow_instance_id", "workflow_instance_status",
             "can_record_payment",
+            "document_id", "document_url", "document_name",
             "created_by", "created_at", "updated_at",
         ]
         read_only_fields = [
@@ -363,6 +384,26 @@ class InvoicePaymentSerializer(serializers.ModelSerializer):
     recorded_by_name = serializers.SerializerMethodField()
     updated_by_name = serializers.SerializerMethodField()
     can_record_payment = serializers.SerializerMethodField()
+    document_id = serializers.SerializerMethodField()
+    document_url = serializers.SerializerMethodField()
+    document_name = serializers.SerializerMethodField()
+
+    def get_document_id(self, obj):
+        doc = obj.documents.first()
+        return doc.id if doc else None
+
+    def get_document_url(self, obj):
+        doc = obj.documents.first()
+        if doc and doc.file:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(doc.file.url)
+            return doc.file.url
+        return None
+
+    def get_document_name(self, obj):
+        doc = obj.documents.first()
+        return doc.file_name if doc else None
     # Internal-only bank fields NOT exposed to vendor
     payer_bank_name = serializers.CharField(read_only=True)
     beneficiary_name = serializers.CharField(read_only=True)
@@ -381,6 +422,7 @@ class InvoicePaymentSerializer(serializers.ModelSerializer):
             "recorded_by", "recorded_by_name", "recorded_at",
             "updated_by", "updated_by_name", "updated_at",
             "can_record_payment",
+            "document_id", "document_url", "document_name",
         ]
         read_only_fields = fields
 
@@ -497,6 +539,31 @@ class InvoiceImportRowSerializer(serializers.ModelSerializer):
     resolved_category_name = serializers.CharField(source="resolved_category.name", read_only=True, default=None)
     resolved_subcategory_name = serializers.CharField(source="resolved_subcategory.name", read_only=True, default=None)
     resolved_budget_name = serializers.CharField(source="resolved_budget.name", read_only=True, default=None)
+    document_id = serializers.SerializerMethodField()
+    document_url = serializers.SerializerMethodField()
+    document_name = serializers.SerializerMethodField()
+
+    def get_document_id(self, obj):
+        if obj.created_invoice_id:
+            doc = obj.created_invoice.documents.first()
+            return doc.id if doc else None
+        return None
+
+    def get_document_url(self, obj):
+        if obj.created_invoice_id:
+            doc = obj.created_invoice.documents.first()
+            if doc and doc.file:
+                request = self.context.get("request")
+                if request:
+                    return request.build_absolute_uri(doc.file.url)
+                return doc.file.url
+        return None
+
+    def get_document_name(self, obj):
+        if obj.created_invoice_id:
+            doc = obj.created_invoice.documents.first()
+            return doc.file_name if doc else None
+        return None
 
     class Meta:
         model = InvoiceImportRow
@@ -526,6 +593,9 @@ class InvoiceImportRowSerializer(serializers.ModelSerializer):
             "created_invoice",
             "status",
             "error_messages",
+            "document_id",
+            "document_url",
+            "document_name",
             "created_at",
         ]
         read_only_fields = fields
@@ -534,6 +604,14 @@ class InvoiceImportRowSerializer(serializers.ModelSerializer):
 class InvoiceImportBatchSerializer(serializers.ModelSerializer):
     rows = InvoiceImportRowSerializer(many=True, read_only=True)
     uploaded_by_email = serializers.CharField(source="uploaded_by.email", read_only=True, default=None)
+    documents_attached_count = serializers.SerializerMethodField()
+
+    def get_documents_attached_count(self, obj):
+        invoice_ids = [r.created_invoice_id for r in obj.rows.all() if r.created_invoice_id]
+        if not invoice_ids:
+            return 0
+        from apps.invoices.models import InvoiceDocument
+        return InvoiceDocument.objects.filter(invoice_id__in=invoice_ids).values("invoice_id").distinct().count()
 
     class Meta:
         model = InvoiceImportBatch
@@ -550,6 +628,7 @@ class InvoiceImportBatchSerializer(serializers.ModelSerializer):
             "created_invoices_count",
             "created_vendors_count",
             "total_amount_deducted",
+            "documents_attached_count",
             "error_summary",
             "activity_logs",
             "created_at",
@@ -561,6 +640,14 @@ class InvoiceImportBatchSerializer(serializers.ModelSerializer):
 
 class InvoiceImportBatchListSerializer(serializers.ModelSerializer):
     uploaded_by_email = serializers.CharField(source="uploaded_by.email", read_only=True, default=None)
+    documents_attached_count = serializers.SerializerMethodField()
+
+    def get_documents_attached_count(self, obj):
+        invoice_ids = [r.created_invoice_id for r in obj.rows.all() if r.created_invoice_id]
+        if not invoice_ids:
+            return 0
+        from apps.invoices.models import InvoiceDocument
+        return InvoiceDocument.objects.filter(invoice_id__in=invoice_ids).values("invoice_id").distinct().count()
 
     class Meta:
         model = InvoiceImportBatch
@@ -577,6 +664,7 @@ class InvoiceImportBatchListSerializer(serializers.ModelSerializer):
             "created_invoices_count",
             "created_vendors_count",
             "total_amount_deducted",
+            "documents_attached_count",
             "activity_logs",
             "created_at",
             "updated_at",
