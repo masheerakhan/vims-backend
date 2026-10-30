@@ -148,6 +148,19 @@ def get_invoice_control_tower_payload(invoice, user):
     if invoice.vendor_id:
         vendor_name = invoice.vendor.vendor_name
 
+    doc = invoice.documents.order_by("-created_at").first()
+    if not doc and getattr(invoice, "vendor_submission", None):
+        doc = invoice.vendor_submission.documents.order_by("-created_at").first()
+
+    document_id = doc.id if doc else None
+    document_url = None
+    document_name = doc.file_name if doc else None
+    if doc and doc.file:
+        try:
+            document_url = doc.file.url
+        except Exception:
+            document_url = None
+
     invoice_header = {
         "id": invoice.id,
         "title": invoice.title,
@@ -161,6 +174,9 @@ def get_invoice_control_tower_payload(invoice, user):
         "created_by_email": invoice.created_by.email if invoice.created_by else None,
         "created_at": invoice.created_at,
         "updated_at": invoice.updated_at,
+        "document_id": document_id,
+        "document_url": document_url,
+        "document_name": document_name,
     }
 
     # ── Workflow template/version ─────────────────────────────────────────────

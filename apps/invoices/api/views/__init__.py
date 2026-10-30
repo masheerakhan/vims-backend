@@ -380,8 +380,25 @@ class InvoiceViewSet(ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="upload-document")
     def upload_document(self, request, pk=None):
-        """Upload and attach an invoice document (PDF/image) directly to this invoice."""
+        """Upload and attach an invoice document (PDF/image) directly to this invoice. Admin only."""
+        from apps.access.models import UserRoleAssignment
         from apps.invoices.models import InvoiceDocument, InvoiceDocumentType
+
+        # Admin only check
+        is_admin = (
+            request.user.is_superuser
+            or UserRoleAssignment.objects.filter(
+                user=request.user,
+                role__code__in=["tenant_admin", "org_admin"],
+                role__is_active=True,
+            ).exists()
+        )
+        if not is_admin:
+            return Response(
+                {"detail": "Only administrators can upload or edit invoice documents."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         invoice = self.get_object()
         file = request.FILES.get("file")
         if not file:
@@ -401,9 +418,10 @@ class InvoiceViewSet(ModelViewSet):
                 else InvoiceDocumentType.SUPPORTING_DOCUMENT
             )
         )
-        existing_doc = invoice.documents.filter(file_name=filename).first()
+        existing_doc = invoice.documents.order_by("-created_at").first()
         if existing_doc:
             existing_doc.file = file
+            existing_doc.file_name = filename
             existing_doc.file_type = ext
             existing_doc.document_type = doc_type
             existing_doc.uploaded_by = request.user
@@ -424,7 +442,7 @@ class InvoiceViewSet(ModelViewSet):
             "file_name": doc.file_name,
             "document_type": doc.document_type,
             "download_url": request.build_absolute_uri(doc.file.url) if doc.file else "",
-        }, status=status.HTTP_201_CREATED)
+        }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get"], url_path="payment")
     def get_payment(self, request, pk=None):
